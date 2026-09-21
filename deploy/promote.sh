@@ -47,20 +47,20 @@ echo "==> byte-compiling (catches a syntax error BEFORE the restart)"
 "$PROD/.venv/bin/python" -m py_compile "$PROD"/src/*.py
 
 echo "==> restarting (MCP first — the chat app is its client)"
-sudo systemctl restart instant-graph-mcp@prod
+sudo systemctl restart ippms-mcp@prod
 sleep 10
-sudo systemctl restart talk-to-vi-ippms@prod
+sudo systemctl restart ippms-app@prod
 sleep 5
 
-systemctl is-active --quiet instant-graph-mcp@prod && systemctl is-active --quiet talk-to-vi-ippms@prod || {
+systemctl is-active --quiet ippms-mcp@prod && systemctl is-active --quiet ippms-app@prod || {
     echo "ERROR: a service failed to come up. Rolling back to $CURRENT" >&2
     git -C "$PROD" checkout -q --detach "$CURRENT"
-    sudo systemctl restart instant-graph-mcp@prod
+    sudo systemctl restart ippms-mcp@prod
     sleep 10
-    sudo systemctl restart talk-to-vi-ippms@prod
-    echo "rolled back. check: journalctl -u talk-to-vi-ippms@prod -n 100" >&2
+    sudo systemctl restart ippms-app@prod
+    echo "rolled back. check: journalctl -u ippms-app@prod -n 100" >&2
     exit 1
 }
 
 echo "==> now on $TAG. Confirm the startup line is CLEAN (no MISSING/disabled):"
-journalctl -u talk-to-vi-ippms@prod -n 25 --no-pager | grep -E '\[STARTUP\]' || true
+journalctl -u ippms-app@prod -n 25 --no-pager | grep -E '\[STARTUP\]' || true

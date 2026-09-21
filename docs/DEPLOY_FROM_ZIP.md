@@ -259,11 +259,13 @@ psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
 ### 3.6 Write the two `.env` files
 
 ```bash
+sudo mkdir -p /etc/ippms-assistant
 for e in prod test; do
-  sudo -u ippms cp /srv/ippms-assistant/$e/.env.example /srv/ippms-assistant/$e/.env
-  sudo -u ippms chmod 600 /srv/ippms-assistant/$e/.env
+  sudo cp /srv/ippms-assistant/$e/.env.example /etc/ippms-assistant/ippms-$e.env
+  sudo chown ippms:ippms /etc/ippms-assistant/ippms-$e.env
+  sudo chmod 600         /etc/ippms-assistant/ippms-$e.env
 done
-sudo -u ippms vi /srv/ippms-assistant/prod/.env
+sudo vi /etc/ippms-assistant/ippms-prod.env
 ```
 
 Cross-check against `~/falconprd-live-env.txt` from §1.1 — anything set there
@@ -323,7 +325,7 @@ ssh -L 8060:127.0.0.1:8060 you@10.19.75.115     # then http://127.0.0.1:8060/
 ### 4.1 Automated preflight
 
 ```bash
-/srv/ippms-assistant/prod/deploy/preflight.sh /srv/ippms-assistant/prod/.env
+/srv/ippms-assistant/prod/deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
 ```
 
 Fix every `✗` before continuing.
@@ -414,13 +416,13 @@ Only once Phase 4 passes.
 sudo cp /srv/ippms-assistant/prod/deploy/*@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
-sudo systemctl enable --now instant-graph-mcp@prod && sleep 10
-sudo systemctl enable --now talk-to-vi-ippms@prod
+sudo systemctl enable --now ippms-mcp@prod && sleep 10
+sudo systemctl enable --now ippms-app@prod
 
-sudo systemctl enable --now instant-graph-mcp@test && sleep 10
-sudo systemctl enable --now talk-to-vi-ippms@test
+sudo systemctl enable --now ippms-mcp@test && sleep 10
+sudo systemctl enable --now ippms-app@test
 
-systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
+systemctl status 'ippms-mcp@*' 'ippms-app@*' --no-pager
 ```
 
 **Reboot the box once** and confirm both come back unattended:
@@ -428,7 +430,7 @@ systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
 ```bash
 sudo reboot
 # then, after it returns:
-systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
+systemctl status 'ippms-mcp@*' 'ippms-app@*' --no-pager
 ```
 
 A deployment that only survives while you are watching is not finished.
@@ -444,8 +446,8 @@ so until `.115` can reach a git remote, promote by directory instead:
 # 1. unpack the new version into test and restart it
 sudo -u ippms unzip -o /tmp/tt_vi_ippms-new.zip -d /tmp/new
 sudo -u ippms cp -r /tmp/new/*/. /srv/ippms-assistant/test/
-sudo systemctl restart instant-graph-mcp@test && sleep 10
-sudo systemctl restart talk-to-vi-ippms@test
+sudo systemctl restart ippms-mcp@test && sleep 10
+sudo systemctl restart ippms-app@test
 
 # 2. verify at :8179 against the ENVIRONMENTS.md checklist
 
@@ -453,14 +455,15 @@ sudo systemctl restart talk-to-vi-ippms@test
 sudo tar czf /srv/ippms-assistant/backups/prod-$(date +%F-%H%M).tgz \
      -C /srv/ippms-assistant prod
 sudo -u ippms rsync -a --delete \
-     --exclude '.venv' --exclude '.env' --exclude 'assets' --exclude 'ig_selfsigned.pem' \
+     --exclude '.venv' --exclude 'assets' --exclude 'ig_selfsigned.pem' \
      /srv/ippms-assistant/test/ /srv/ippms-assistant/prod/
-sudo systemctl restart instant-graph-mcp@prod && sleep 10
-sudo systemctl restart talk-to-vi-ippms@prod
+sudo systemctl restart ippms-mcp@prod && sleep 10
+sudo systemctl restart ippms-app@prod
 ```
 
-The `--exclude`s matter: they are what keeps prod's own `.env`, venv and
-assets from being overwritten by test's.
+The `--exclude`s keep prod's venv and assets from being overwritten by
+test's. The env files need no exclude — they live in `/etc/ippms-assistant/`,
+outside the checkout, which is exactly why they are kept there.
 
 Rollback is the matching backup tarball.
 
@@ -486,7 +489,7 @@ Rollback is the matching backup tarball.
 3. Repoint DNS or your reverse proxy to `10.19.75.115:8079`.
 4. Watch for 30 minutes:
    ```bash
-   journalctl -u talk-to-vi-ippms@prod -u instant-graph-mcp@prod -f
+   journalctl -u ippms-app@prod -u ippms-mcp@prod -f
    ```
 
 ### Rollback
@@ -496,7 +499,7 @@ reconcile:
 
 ```bash
 # on .115
-sudo systemctl stop talk-to-vi-ippms@prod instant-graph-mcp@prod
+sudo systemctl stop ippms-app@prod ippms-mcp@prod
 # on .246 — re-enable the original units
 sudo systemctl enable --now <mcp-unit> && sleep 10
 sudo systemctl enable --now <chat-unit>
@@ -534,4 +537,4 @@ buy a 60-second rollback.
 | `question guide MISSING` | asset not copied, or `openpyxl` missing |
 | Postgres auth failure | `pg_hba.conf` has no loopback rule — §3.5 |
 | Ops console refuses connection | `DASH_HOST` is `127.0.0.1` by design — use the SSH tunnel, §3.7 |
-| Test rows landing in the prod schema | `IG_DB_SCHEMA` or `MCP_SERVER_URL` not changed in `test/.env` |
+| Test rows landing in the prod schema | `IG_DB_SCHEMA` or `MCP_SERVER_URL` not changed in `ippms-test.env` |

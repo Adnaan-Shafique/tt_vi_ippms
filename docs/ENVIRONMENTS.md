@@ -14,10 +14,14 @@ Two separate checkouts, two venvs, two `.env` files, two Postgres schemas.
 ```
 /srv/ippms-assistant/
 ├── prod/                       ← detached at a release TAG, never a branch
-│   ├── .venv/  .env  src/  assets/  ig_selfsigned.pem
+│   ├── .venv/  src/  assets/  ig_selfsigned.pem
 ├── test/                       ← tracks a branch; where you try things
-│   ├── .venv/  .env  src/  assets/  ig_selfsigned.pem
+│   ├── .venv/  src/  assets/  ig_selfsigned.pem
 └── backups/
+
+/etc/ippms-assistant/           ← secrets, deliberately OUTSIDE the checkout
+├── ippms-prod.env                 so a redeploy, rsync or git clean
+└── ippms-test.env                 can never touch them
 ```
 
 | | prod | test |
@@ -63,11 +67,13 @@ sudo -u ippms git clone <repo-url> /srv/ippms-assistant/test
 sudo -u ippms git -C /srv/ippms-assistant/prod checkout --detach v1.0.0
 sudo -u ippms git -C /srv/ippms-assistant/test checkout main
 
+sudo mkdir -p /etc/ippms-assistant
 for e in prod test; do
   sudo -u ippms python3 -m venv /srv/ippms-assistant/$e/.venv
   sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install -r /srv/ippms-assistant/$e/requirements.txt
-  sudo -u ippms cp /srv/ippms-assistant/$e/.env.example /srv/ippms-assistant/$e/.env
-  sudo -u ippms chmod 600 /srv/ippms-assistant/$e/.env
+  sudo cp /srv/ippms-assistant/$e/.env.example /etc/ippms-assistant/ippms-$e.env
+  sudo chown ippms:ippms /etc/ippms-assistant/ippms-$e.env
+  sudo chmod 600         /etc/ippms-assistant/ippms-$e.env
 done
 ```
 
@@ -78,7 +84,7 @@ psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
      -v schema=tt_vi_ippms_schema_test -f /srv/ippms-assistant/test/sql/setup_ig_auth_tables.sql
 ```
 
-Edit each `.env` — for `test/.env` change **all five**:
+Edit each `.env` — for `ippms-test.env` change **all five**:
 
 ```bash
 IG_DB_SCHEMA=tt_vi_ippms_schema_test
@@ -98,10 +104,10 @@ Install the templated units:
 ```bash
 sudo cp /srv/ippms-assistant/prod/deploy/*@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now instant-graph-mcp@prod && sleep 10
-sudo systemctl enable --now talk-to-vi-ippms@prod
-sudo systemctl enable --now instant-graph-mcp@test && sleep 10
-sudo systemctl enable --now talk-to-vi-ippms@test
+sudo systemctl enable --now ippms-mcp@prod && sleep 10
+sudo systemctl enable --now ippms-app@prod
+sudo systemctl enable --now ippms-mcp@test && sleep 10
+sudo systemctl enable --now ippms-app@test
 ```
 
 ---
@@ -110,14 +116,14 @@ sudo systemctl enable --now talk-to-vi-ippms@test
 
 ```bash
 # status of everything
-systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
+systemctl status 'ippms-mcp@*' 'ippms-app@*' --no-pager
 
 # follow one environment
-journalctl -u talk-to-vi-ippms@test -u instant-graph-mcp@test -f
+journalctl -u ippms-app@test -u ippms-mcp@test -f
 
 # restart an environment — MCP first, the chat app is its client
-sudo systemctl restart instant-graph-mcp@test && sleep 10
-sudo systemctl restart talk-to-vi-ippms@test
+sudo systemctl restart ippms-mcp@test && sleep 10
+sudo systemctl restart ippms-app@test
 
 # what is in prod right now
 git -C /srv/ippms-assistant/prod describe --tags
@@ -143,8 +149,8 @@ git checkout -b feature/my-change
 ```bash
 sudo -u ippms git -C /srv/ippms-assistant/test pull origin main
 sudo -u ippms /srv/ippms-assistant/test/.venv/bin/pip install -r /srv/ippms-assistant/test/requirements.txt
-sudo systemctl restart instant-graph-mcp@test && sleep 10
-sudo systemctl restart talk-to-vi-ippms@test
+sudo systemctl restart ippms-mcp@test && sleep 10
+sudo systemctl restart ippms-app@test
 ```
 
 Exercise it at `http://10.19.75.115:8179/`. The ops console binds loopback —
@@ -173,8 +179,8 @@ and **rolls back automatically** if either service fails to come up.
 ### 5. Verify prod
 
 ```bash
-deploy/preflight.sh /srv/ippms-assistant/prod/.env
-journalctl -u talk-to-vi-ippms@prod -n 30 --no-pager | grep STARTUP
+deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
+journalctl -u ippms-app@prod -n 30 --no-pager | grep STARTUP
 ```
 
 ### Rollback

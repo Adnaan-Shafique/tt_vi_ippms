@@ -2,7 +2,7 @@
 # ══════════════════════════════════════════════════════════════════════════
 #  preflight.sh — verify 10.19.75.115 can actually run this before migrating
 #
-#    deploy/preflight.sh /srv/ippms-assistant/prod/.env
+#    deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
 #
 #  Read-only. Checks every external dependency the app has. Run it BEFORE
 #  moving anything — the expensive failure mode is discovering the gateway is
@@ -10,7 +10,7 @@
 # ══════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
-ENV_FILE="${1:-/srv/ippms-assistant/prod/.env}"
+ENV_FILE="${1:-/etc/ippms-assistant/ippms-prod.env}"
 FAIL=0
 pass() { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31m✗\033[0m %s\n' "$*"; FAIL=1; }

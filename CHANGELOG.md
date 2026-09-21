@@ -51,10 +51,14 @@ security work around that unchanged core.
 - `requirements.txt`, `.gitignore`.
 
 ### Added — deployment
-- Templated systemd units `instant-graph-mcp@.service` and
-  `talk-to-vi-ippms@.service`, instantiated per environment (`@prod`, `@test`).
-  FALCONPRD ran a single systemd-managed environment; this splits it into a
-  promotable prod/test pair.
+- Templated systemd units `ippms-mcp@.service` and `ippms-app@.service`,
+  derived from the existing FALCONPRD units and instantiated per environment
+  (`@prod`, `@test`). Keeps their `StartLimitIntervalSec=0` (systemd's default
+  rate limit is the usual reason a service that should self-heal is found dead
+  the next morning), `Restart=always`, and `Wants=` rather than `Requires=` on
+  the MCP dependency so the chat UI stays up when the MCP server is down.
+- Secrets moved to `/etc/ippms-assistant/ippms-<env>.env`, outside the
+  deployment directory, so a redeploy, rsync or `git clean` cannot touch them.
 - `docs/ENVIRONMENTS.md` — the prod/test layout and the promotion workflow.
 - `deploy/promote.sh` — deploys an existing, tested git tag to prod and
   restarts it in dependency order, with automatic rollback if either service

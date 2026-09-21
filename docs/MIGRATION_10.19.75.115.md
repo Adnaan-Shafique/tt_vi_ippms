@@ -267,9 +267,11 @@ psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
 ### 5.4 `.env` per environment
 
 ```bash
+sudo mkdir -p /etc/ippms-assistant
 for e in prod test; do
-  sudo -u ippms cp /srv/ippms-assistant/$e/.env.example /srv/ippms-assistant/$e/.env
-  sudo -u ippms chmod 600 /srv/ippms-assistant/$e/.env
+  sudo cp /srv/ippms-assistant/$e/.env.example /etc/ippms-assistant/ippms-$e.env
+  sudo chown ippms:ippms /etc/ippms-assistant/ippms-$e.env
+  sudo chmod 600         /etc/ippms-assistant/ippms-$e.env
 done
 ```
 
@@ -288,7 +290,7 @@ VI_TOOL_KB_PATH=/srv/ippms-assistant/prod/assets/vi_ippms_tool_kb.md
 VI_QUESTION_GUIDE_PATH=/srv/ippms-assistant/prod/assets/vi_ippms_question_guide.xlsx
 ```
 
-For `test/.env` change **all five** of `IG_DB_SCHEMA`, `IG_DB_SESSION_KEY`,
+For `ippms-test.env` change **all five** of `IG_DB_SCHEMA`, `IG_DB_SESSION_KEY`,
 `MCP_PORT`, `MCP_SERVER_URL`, `DASH_PORT`, `VI_APP_PORT` — and note that
 `MCP_SERVER_URL` is the one people forget, which silently points the test chat
 app at the **production** MCP server. See `docs/ENVIRONMENTS.md`.
@@ -318,7 +320,7 @@ surface and the ops console is an admin surface. Tunnel to the console:
 ### 6.1 Automated preflight
 
 ```bash
-deploy/preflight.sh /srv/ippms-assistant/prod/.env
+deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
 ```
 
 Checks secrets, assets, Postgres, auth tables, the relay, the GPU proxy and
@@ -398,9 +400,9 @@ seeing them is the clearest single proof that nothing was lost.
 Only once 6.1–6.5 pass. See `docs/ENVIRONMENTS.md`, then:
 
 ```bash
-sudo systemctl enable --now instant-graph-mcp@prod && sleep 10
-sudo systemctl enable --now talk-to-vi-ippms@prod
-systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
+sudo systemctl enable --now ippms-mcp@prod && sleep 10
+sudo systemctl enable --now ippms-app@prod
+systemctl status 'ippms-mcp@*' 'ippms-app@*' --no-pager
 ```
 
 **Reboot the box once** and confirm both come back unattended.
@@ -427,7 +429,7 @@ systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
    `10.19.75.115:8079`. Updating DNS beats asking everyone to learn a new IP.
 4. Watch for 30 minutes:
    ```bash
-   journalctl -u talk-to-vi-ippms@prod -u instant-graph-mcp@prod -f
+   journalctl -u ippms-app@prod -u ippms-mcp@prod -f
    ```
 
 ---
@@ -439,7 +441,7 @@ genuinely trivial — **provided you did not delete the FALCONPRD checkout**:
 
 ```bash
 # on .115
-sudo systemctl stop talk-to-vi-ippms@prod instant-graph-mcp@prod
+sudo systemctl stop ippms-app@prod ippms-mcp@prod
 # on .246 — re-enable the original units
 sudo systemctl enable --now <mcp-unit> && sleep 10
 sudo systemctl enable --now <chat-unit>
@@ -479,6 +481,7 @@ Once a week of clean running has passed:
 | Source host | `10.19.71.246` (FALCONPRD) — **stays up** |
 | Target host | `10.19.75.115` (also the Postgres host) |
 | Install path | `/srv/ippms-assistant/{prod,test}` |
+| Env files | `/etc/ippms-assistant/ippms-{prod,test}.env` |
 | Service user | `ippms` |
 | Prod chat UI / ops | `:8079` published / `:8060` loopback |
 | Test chat UI / ops | `:8179` published / `:8160` loopback |
@@ -486,4 +489,4 @@ Once a week of clean running has passed:
 | Postgres | `conv_ai_db`, schemas `tt_vi_ippms_schema{,_test}` — **does not move** |
 | Gateway relay | squid CONNECT on `10.19.71.246:3128` |
 | GPU proxy | `10.19.71.246:8071` — stays on FALCONPRD |
-| Services | `instant-graph-mcp@{prod,test}` → `talk-to-vi-ippms@{prod,test}` |
+| Services | `ippms-mcp@{prod,test}` → `ippms-app@{prod,test}` |

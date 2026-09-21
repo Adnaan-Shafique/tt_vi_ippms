@@ -196,15 +196,15 @@ Production runs under **systemd**, as two independent environments:
 | DB schema | `tt_vi_ippms_schema` | `tt_vi_ippms_schema_test` |
 
 ```bash
-sudo systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*'
-journalctl -u talk-to-vi-ippms@test -f
+sudo systemctl status 'ippms-mcp@*' 'ippms-app@*'
+journalctl -u ippms-app@test -f
 ```
 
 Release cycle: merge to `main` → deploy to **test** → tag → promote.
 
 ```bash
 deploy/promote.sh v1.1.0        # deploys a tested tag to prod, auto-rollback
-deploy/preflight.sh /srv/ippms-assistant/prod/.env
+deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
 ```
 
 Setting this up on a new host from a zip: **`docs/DEPLOY_FROM_ZIP.md`**.
@@ -261,8 +261,8 @@ access, edit that set and restart.
 │   └── setup_ig_auth_tables.sql       ← the 2 tables that do NOT auto-create
 ├── assets/                            ← tool KB + question guide (gitignored)
 ├── deploy/
-│   ├── instant-graph-mcp@.service     ← templated: @prod / @test
-│   ├── talk-to-vi-ippms@.service
+│   ├── ippms-mcp@.service     ← templated: @prod / @test
+│   ├── ippms-app@.service
 │   ├── promote.sh                     ← tested tag → prod, with rollback
 │   ├── preflight.sh                   ← verify every external dependency
 │   └── relay/
@@ -291,6 +291,12 @@ why `deploy/preflight.sh` exists:
 | **GPU proxy** | `GPULLMClient.infer()` never raises — it returns `""`. A dead proxy produces bad routing and empty answers, not a crash. |
 | **Question guide** | Missing → app starts normally, RAG retrieval disabled, answer quality quietly drops. |
 | **Postgres** | All logging is best-effort by design; an outage loses history and audit rows without failing a chat turn. |
+
+**Do not run the chat app under gunicorn or another WSGI server.**
+`_warm_startup()` runs only under `if __name__ == "__main__"`
+(`src/talk_to_vi_ippms_updated_6_7_2.py:6343`), so under WSGI the tool KB, the
+RAG index, the table creation and the 7-day chat-history retention sweeper
+never start — conversations then accumulate forever with no error anywhere.
 
 The startup line reports all of them — read it after every deploy:
 

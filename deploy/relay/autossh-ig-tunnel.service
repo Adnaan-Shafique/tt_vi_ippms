@@ -19,7 +19,7 @@
 Description=autossh tunnel to Instant Graph gateway via FALCONPRD
 After=network-online.target
 Wants=network-online.target
-Before=instant-graph-mcp@prod.service instant-graph-mcp@test.service
+Before=ippms-mcp@prod.service ippms-mcp@test.service
 
 [Service]
 Type=simple

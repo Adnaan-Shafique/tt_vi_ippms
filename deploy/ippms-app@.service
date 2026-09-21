@@ -1,0 +1,55 @@
+# /etc/systemd/system/ippms-app@.service
+#
+#  TEMPLATE UNIT — %i is the environment name: "prod" or "test".
+#    sudo systemctl enable --now ippms-app@prod
+#    sudo systemctl enable --now ippms-app@test
+#
+#  Derived from the FALCONPRD ippms-app.service, keeping its restart and
+#  dependency decisions; the only change is per-instance paths.
+
+[Unit]
+Description=Talk to VI-IPPMS (conversational analytics chat app) (%i)
+Documentation=https://github.com/adnaan-shafique/tt_vi_ippms
+After=network-online.target ippms-mcp@%i.service
+Wants=network-online.target ippms-mcp@%i.service
+# Wants= (not Requires=): the chat app starts and serves its UI even if the
+# MCP server is down — it retries on every call and logs a warning — so a
+# temporarily missing MCP server shouldn't take the whole UI offline. Switch
+# to Requires= if you'd rather the UI refuse to run without it.
+#
+# Note it pre-lists the MCP tools once at startup, so a chat app that came up
+# first logs "Could not pre-list MCP tools". Restart=always plus RestartSec
+# covers that; nothing else is needed.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ippms
+Group=ippms
+WorkingDirectory=/srv/ippms-assistant/%i
+
+EnvironmentFile=/etc/ippms-assistant/ippms-%i.env
+Environment=PYTHONUNBUFFERED=1
+
+# Run the script directly rather than under gunicorn. _warm_startup() — which
+# starts the 7-day chat-history retention sweeper — only runs under
+# `if __name__ == "__main__"` (src/talk_to_vi_ippms_updated_6_7_2.py:6343), so
+# under a WSGI server that sweeper never starts and old conversations are
+# never purged. The tool KB, RAG index and table creation warm up there too.
+ExecStart=/srv/ippms-assistant/%i/.venv/bin/python src/talk_to_vi_ippms_updated_6_7_2.py
+
+Restart=always
+RestartSec=5s
+TimeoutStopSec=20s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ippms-app-%i
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

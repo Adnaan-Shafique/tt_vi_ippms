@@ -1,0 +1,63 @@
+# /etc/systemd/system/ippms-mcp@.service
+#
+#  TEMPLATE UNIT — %i is the environment name: "prod" or "test".
+#    sudo systemctl enable --now ippms-mcp@prod
+#    sudo systemctl enable --now ippms-mcp@test
+#
+#  Derived from the FALCONPRD ippms-mcp.service, keeping its restart and
+#  hardening decisions; the only change is per-instance paths so prod and test
+#  can run side by side.
+#
+#  Serves the FastMCP endpoint and the Dash ops console. Both bind 127.0.0.1
+#  (see the env file) — the tool surface is unauthenticated and the console is
+#  an admin surface. Reach the console over an SSH tunnel.
+
+[Unit]
+Description=Instant Graph MCP server (%i)
+Documentation=https://github.com/adnaan-shafique/tt_vi_ippms
+After=network-online.target
+Wants=network-online.target
+# Keep restarting forever. systemd's default rate limit (5 starts in 10s, then
+# give up and sit in "failed") is the usual reason a service that was supposed
+# to self-heal is found dead the next morning — e.g. Postgres or the squid
+# relay being slow to come back after a reboot means the first few starts
+# fail, systemd hits the limit, and then nothing ever retries.
+StartLimitIntervalSec=0
+# RHEL 7 only (systemd 219): these two live in [Service] and are named
+# StartLimitInterval / StartLimitBurst instead. RHEL 8/9 use the above.
+#
+# Uncomment if using the autossh fallback instead of the squid relay:
+# Requires=autossh-ig-tunnel.service
+# After=autossh-ig-tunnel.service
+
+[Service]
+Type=simple
+User=ippms
+Group=ippms
+WorkingDirectory=/srv/ippms-assistant/%i
+
+# Secrets live here, NOT in this unit file (unit files are world-readable) and
+# NOT inside the deployment directory — so a redeploy, rsync or git clean can
+# never touch them. chmod 600, chown ippms:ippms.
+EnvironmentFile=/etc/ippms-assistant/ippms-%i.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/srv/ippms-assistant/%i/.venv/bin/python src/instant_graph_mcp_server_v2_5.py
+
+Restart=always
+RestartSec=5s
+TimeoutStopSec=20s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ippms-mcp-%i
+
+# Modest hardening. Drop any of these if they get in the way — none is
+# required for the service to work.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
