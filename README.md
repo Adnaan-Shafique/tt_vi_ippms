@@ -207,7 +207,14 @@ deploy/promote.sh v1.1.0        # deploys a tested tag to prod, auto-rollback
 deploy/preflight.sh /srv/ippms-assistant/prod/.env
 ```
 
-Full setup and the acceptance checklist: **`docs/ENVIRONMENTS.md`**.
+Setting this up on a new host from a zip: **`docs/DEPLOY_FROM_ZIP.md`**.
+Day-to-day environment layout and the acceptance checklist:
+**`docs/ENVIRONMENTS.md`**. Why it is shaped this way:
+**`docs/MIGRATION_10.19.75.115.md`**.
+
+> The zip does **not** contain `assets/`, `ig_selfsigned.pem` or `.env` —
+> all three are gitignored. They must be copied across separately, or
+> nothing starts. See `docs/DEPLOY_FROM_ZIP.md` §1.2.
 
 ### Running by hand (debugging)
 
@@ -262,6 +269,7 @@ access, edit that set and restart.
 │       ├── squid-ig-relay.conf        ← CONNECT relay, runs on FALCONPRD
 │       └── autossh-ig-tunnel.service  ← fallback
 └── docs/
+    ├── DEPLOY_FROM_ZIP.md             ← START HERE on a new host
     ├── ENVIRONMENTS.md                ← prod/test layout + release cycle
     └── MIGRATION_10.19.75.115.md      ← FALCONPRD → 10.19.75.115 runbook
 ```
