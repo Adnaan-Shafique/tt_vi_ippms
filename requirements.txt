@@ -1,0 +1,23 @@
+# Talk-to-VI-IPPMS — pinned-by-minor runtime deps.
+# Install:  pip install -r requirements.txt
+#
+# NOTE: these are the libraries both processes import. Pin exact versions
+# (pip freeze) from the working FALCONPRD host before migrating if you want a
+# byte-identical environment — see docs/MIGRATION_10.19.75.115.md step 3.
+
+# --- Agent / MCP ---
+langgraph
+mcp[cli]
+
+# --- Web UI ---
+dash
+plotly
+
+# --- Data ---
+pandas
+openpyxl          # required by pd.read_excel() for the question guide
+
+# --- HTTP / DB ---
+requests
+psycopg2-binary
+pydantic

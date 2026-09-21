@@ -1,0 +1,24 @@
+# ── Secrets: never commit ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# ── Runtime assets fetched/placed per-host ────────────────────────────
+assets/vi_ippms_question_guide.xlsx
+assets/vi_ippms_tool_kb.md
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── Logs / scratch ────────────────────────────────────────────────────
+*.log
+logs/
+*.csv
+.DS_Store
