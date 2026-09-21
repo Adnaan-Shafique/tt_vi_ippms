@@ -25,7 +25,7 @@ data that is already in the right place.
 | Postgres `:5432` | 10.19.75.115 | 10.19.75.115 *(unchanged)* |
 | GPU proxy `:8071` | 10.19.71.246 | **stays on FALCONPRD** |
 | Instant Graph API | direct from `.246` | **relayed through `.246`** |
-| Process manager | `nohup` | **systemd** |
+| Process manager | systemd (single env) | **systemd** (prod + test) |
 
 ### FALCONPRD is not being decommissioned
 
@@ -186,10 +186,7 @@ authoritative record of what actually works.
 # Exact dependency versions — "latest" may not resolve the same way today
 pip freeze > /tmp/falconprd-freeze.txt
 
-# The REAL runtime env of the live processes. Since you run under nohup, any
-# variable exported in that shell is invisible in both the source AND in any
-# unit file — /proc is the only place it still exists. Capture it before the
-# processes are stopped, or it is gone.
+# The REAL runtime env of the live processes, plus the existing unit files.
 pgrep -af 'talk_to_vi_ippms|instant_graph_mcp'
 for pid in $(pgrep -f 'talk_to_vi_ippms|instant_graph_mcp'); do
     echo "--- $pid ---"; sudo cat /proc/$pid/environ | tr '\0' '\n'
@@ -204,9 +201,8 @@ ls -la vi_ippms_tool_kb.md vi_ippms_question_guide.xlsx /srv/ippms-assistant/ig_
 before `sudo` runs. `sudo ps eww -p <pid>` works too.
 
 The `/proc/<pid>/environ` step is the one to be careful about. A value
-overridden in your nohup shell but left at its source default in git is a
-classic post-migration mystery, and stopping the process destroys the
-evidence.
+set in the live unit but left at its source default in git is a classic
+post-migration mystery.
 
 ---
 
@@ -306,14 +302,14 @@ app at the **production** MCP server. See `docs/ENVIRONMENTS.md`.
 
 ```bash
 sudo firewall-cmd --permanent --add-port=8079/tcp   # prod chat UI
-sudo firewall-cmd --permanent --add-port=8060/tcp   # prod ops console
 sudo firewall-cmd --permanent --add-port=8179/tcp   # test chat UI
-sudo firewall-cmd --permanent --add-port=8160/tcp   # test ops console
 sudo firewall-cmd --reload
 ```
 
-Leave `8056`/`8156` **closed** — the MCP servers bind `127.0.0.1` and expose
-the whole Instant Graph tool surface unauthenticated.
+Only the chat UIs are published. `MCP_HOST` and `DASH_HOST` both bind
+`127.0.0.1`, as on FALCONPRD — the MCP endpoint is an unauthenticated tool
+surface and the ops console is an admin surface. Tunnel to the console:
+`ssh -L 8060:127.0.0.1:8060 you@10.19.75.115`.
 
 ---
 
@@ -342,8 +338,8 @@ sudo -u ippms -E .venv/bin/python src/instant_graph_mcp_server_v2_5.py
 Expect the banner and
 `Connected to Postgres token store at 127.0.0.1:5432/conv_ai_db`.
 
-Then open `http://10.19.75.115:8060/`, log in with email + employee id, and
-walk the explorer: **host → component → interface → KPI → historical data**.
+Then tunnel (`ssh -L 8060:127.0.0.1:8060 you@10.19.75.115`), open
+`http://127.0.0.1:8060/`, log in with email + employee id, and walk the explorer: **host → component → interface → KPI → historical data**.
 This is the fastest end-to-end proof that the relay, the TLS pinning and the
 token manager all work from this host. If data renders, the hard part is done.
 
@@ -407,9 +403,7 @@ sudo systemctl enable --now talk-to-vi-ippms@prod
 systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
 ```
 
-**Reboot the box once** and confirm both come back unattended. A migration
-that only survives while you are watching is not finished — and this is
-exactly the failure mode `nohup` had.
+**Reboot the box once** and confirm both come back unattended.
 
 ---
 
@@ -420,12 +414,10 @@ exactly the failure mode `nohup` had.
    to the same tables and share `ig_auth_sessions` keys, so two live copies
    will fight over token refresh and produce confusing auth failures.
    ```bash
-   # on 10.19.71.246 — app processes only. Leave squid and the GPU proxy UP.
-   pkill -f talk_to_vi_ippms
-   pkill -f instant_graph_mcp
+   # on 10.19.71.246 — app units only. Leave squid and the GPU proxy UP.
+   sudo systemctl disable --now <mcp-unit> <chat-unit>
    ```
-   Also remove any `@reboot` cron entry or rc-local line that would restart
-   them.
+   Use `disable --now`, not `pkill`: systemd restarts a killed service.
 
    > **Leave squid and the GPU proxy running on `.246`.** They are now part of
    > the production path. This is the step most likely to go wrong out of
@@ -448,11 +440,9 @@ genuinely trivial — **provided you did not delete the FALCONPRD checkout**:
 ```bash
 # on .115
 sudo systemctl stop talk-to-vi-ippms@prod instant-graph-mcp@prod
-# on .246 — as before
-cd /srv/ippms-assistant
-nohup python3 instant_graph_mcp_server_v2_5.py > mcp.log 2>&1 &
-sleep 10
-nohup python3 talk_to_vi_ippms_updated_6_7_2.py > app.log 2>&1 &
+# on .246 — re-enable the original units
+sudo systemctl enable --now <mcp-unit> && sleep 10
+sudo systemctl enable --now <chat-unit>
 # revert DNS
 ```
 
@@ -490,8 +480,8 @@ Once a week of clean running has passed:
 | Target host | `10.19.75.115` (also the Postgres host) |
 | Install path | `/srv/ippms-assistant/{prod,test}` |
 | Service user | `ippms` |
-| Prod chat UI / ops | `:8079` / `:8060` |
-| Test chat UI / ops | `:8179` / `:8160` |
+| Prod chat UI / ops | `:8079` published / `:8060` loopback |
+| Test chat UI / ops | `:8179` published / `:8160` loopback |
 | MCP endpoints | `:8056` / `:8156` — loopback only |
 | Postgres | `conv_ai_db`, schemas `tt_vi_ippms_schema{,_test}` — **does not move** |
 | Gateway relay | squid CONNECT on `10.19.71.246:3128` |

@@ -53,7 +53,8 @@ security work around that unchanged core.
 ### Added — deployment
 - Templated systemd units `instant-graph-mcp@.service` and
   `talk-to-vi-ippms@.service`, instantiated per environment (`@prod`, `@test`).
-  Replaces running the scripts under `nohup`.
+  FALCONPRD ran a single systemd-managed environment; this splits it into a
+  promotable prod/test pair.
 - `docs/ENVIRONMENTS.md` — the prod/test layout and the promotion workflow.
 - `deploy/promote.sh` — deploys an existing, tested git tag to prod and
   restarts it in dependency order, with automatic rollback if either service
@@ -92,9 +93,10 @@ and has no GPU, so both must be reached through FALCONPRD:
 
   Both now come from the environment only. **Rotate both credentials** — they
   existed in plaintext in the distributed source.
-- The MCP endpoint now binds `127.0.0.1` by default rather than `0.0.0.0`. It
-  exposes the whole Instant Graph tool surface unauthenticated and only ever
-  needs to be reachable by the co-located chat app.
+- `MCP_HOST` and `DASH_HOST` now default to `127.0.0.1` rather than
+  `0.0.0.0`, matching the FALCONPRD deployment. The MCP endpoint is an
+  unauthenticated tool surface and the ops console is an admin surface;
+  neither belongs on a public interface. Only the chat UI is published.
 
 ### Migration notes
 - The application moved hosts; **Postgres did not**. `10.19.75.115` was

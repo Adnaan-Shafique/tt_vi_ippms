@@ -24,6 +24,7 @@ Type=simple
 User=ippms
 Group=ippms
 WorkingDirectory=/srv/ippms-assistant/%i
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/srv/ippms-assistant/%i/.env
 ExecStart=/srv/ippms-assistant/%i/.venv/bin/python src/talk_to_vi_ippms_updated_6_7_2.py
 Restart=on-failure

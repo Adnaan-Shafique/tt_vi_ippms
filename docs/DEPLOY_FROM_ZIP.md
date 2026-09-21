@@ -33,9 +33,8 @@ Also: if you download the zip from GitHub's "Download ZIP" button it contains
 
 ### 1.1 Capture the live environment ►► DO THIS FIRST
 
-You run under `nohup`, so any variable exported in that shell exists **only**
-in the running process. It is in neither the source nor a unit file. Stopping
-the process destroys it permanently.
+The live processes hold settings that exist nowhere else in a readable form.
+Capture them before stopping anything.
 
 ```bash
 pgrep -af 'talk_to_vi_ippms|instant_graph_mcp'
@@ -44,6 +43,16 @@ for pid in $(pgrep -f 'talk_to_vi_ippms|instant_graph_mcp'); do
     echo "=== $pid ==="
     sudo cat /proc/$pid/environ | tr '\0' '\n'
 done | tee ~/falconprd-live-env.txt
+```
+
+**Check for existing unit files first.** If the output contains
+`INVOCATION_ID` or `JOURNAL_STREAM`, these processes are already managed by
+systemd, and the real units are better starting points than the templates in
+`deploy/`:
+
+```bash
+systemctl status <pid> <pid> | head -20      # reveals the unit names
+sudo systemctl cat <unit> <unit> | tee ~/ippms-transfer/falconprd-units.txt
 ```
 
 > `sudo` must do the **reading**. Writing it as
@@ -294,14 +303,18 @@ VI_APP_PORT=8179
 
 ```bash
 sudo firewall-cmd --permanent --add-port=8079/tcp   # prod chat UI
-sudo firewall-cmd --permanent --add-port=8060/tcp   # prod ops console
 sudo firewall-cmd --permanent --add-port=8179/tcp   # test chat UI
-sudo firewall-cmd --permanent --add-port=8160/tcp   # test ops console
 sudo firewall-cmd --reload
 ```
 
-Leave `8056`/`8156` closed — the MCP servers bind loopback and expose the
-whole tool surface unauthenticated.
+**Only the chat UIs are published.** `MCP_HOST` and `DASH_HOST` both bind
+`127.0.0.1`, matching the FALCONPRD deployment: the MCP endpoint is an
+unauthenticated tool surface, and the ops console is an admin surface. Reach
+the console over an SSH tunnel when you need it:
+
+```bash
+ssh -L 8060:127.0.0.1:8060 you@10.19.75.115     # then http://127.0.0.1:8060/
+```
 
 ---
 
@@ -328,7 +341,14 @@ sudo -u ippms -E .venv/bin/python src/instant_graph_mcp_server_v2_5.py
 Expect the banner and
 `Connected to Postgres token store at 127.0.0.1:5432/conv_ai_db`.
 
-Now open `http://10.19.75.115:8060/`, log in with your email + employee id,
+Now tunnel to the console — it binds loopback, so it is not reachable
+directly:
+
+```bash
+ssh -L 8060:127.0.0.1:8060 you@10.19.75.115
+```
+
+Open `http://127.0.0.1:8060/`, log in with your email + employee id,
 and walk the explorer: **host → component → interface → KPI → historical
 data**. This one action proves the relay, the TLS pinning, the token manager
 and the database all work from this host. If data renders, the hard part is
@@ -411,8 +431,7 @@ sudo reboot
 systemctl status 'instant-graph-mcp@*' 'talk-to-vi-ippms@*' --no-pager
 ```
 
-A deployment that only survives while you are watching is not finished — and
-that is exactly the failure mode `nohup` had.
+A deployment that only survives while you are watching is not finished.
 
 ---
 
@@ -455,12 +474,11 @@ Rollback is the matching backup tarball.
 ## Phase 7 — Cutover
 
 1. Announce a short window.
-2. Stop the FALCONPRD **app processes only**:
+2. Stop the FALCONPRD **app services only** (they run under systemd — use the
+   unit names found in §1.1, not `pkill`, or systemd will restart them):
    ```bash
    # on .246
-   pkill -f talk_to_vi_ippms
-   pkill -f instant_graph_mcp
-   crontab -l      # remove any @reboot entry that would restart them
+   sudo systemctl disable --now <mcp-unit> <chat-unit>
    ```
    > **Leave squid and the GPU proxy running.** They are production
    > infrastructure now. This is the step most likely to go wrong out of
@@ -479,11 +497,9 @@ reconcile:
 ```bash
 # on .115
 sudo systemctl stop talk-to-vi-ippms@prod instant-graph-mcp@prod
-# on .246, as before
-cd /srv/ippms-assistant
-nohup python3 instant_graph_mcp_server_v2_5.py > mcp.log 2>&1 &
-sleep 10
-nohup python3 talk_to_vi_ippms_updated_6_7_2.py > app.log 2>&1 &
+# on .246 — re-enable the original units
+sudo systemctl enable --now <mcp-unit> && sleep 10
+sudo systemctl enable --now <chat-unit>
 # revert DNS
 ```
 
@@ -517,4 +533,5 @@ buy a 60-second rollback.
 | Answers vague / routing odd, no errors | GPU proxy unreachable — `infer()` returns `""` silently. §4.3 |
 | `question guide MISSING` | asset not copied, or `openpyxl` missing |
 | Postgres auth failure | `pg_hba.conf` has no loopback rule — §3.5 |
+| Ops console refuses connection | `DASH_HOST` is `127.0.0.1` by design — use the SSH tunnel, §3.7 |
 | Test rows landing in the prod schema | `IG_DB_SCHEMA` or `MCP_SERVER_URL` not changed in `test/.env` |

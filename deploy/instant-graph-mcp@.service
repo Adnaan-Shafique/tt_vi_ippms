@@ -24,6 +24,7 @@ Type=simple
 User=ippms
 Group=ippms
 WorkingDirectory=/srv/ippms-assistant/%i
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/srv/ippms-assistant/%i/.env
 ExecStart=/srv/ippms-assistant/%i/.venv/bin/python src/instant_graph_mcp_server_v2_5.py
 Restart=on-failure

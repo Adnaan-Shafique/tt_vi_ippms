@@ -1,7 +1,8 @@
 # Environments: test → prod
 
-Replaces the `nohup` workflow from FALCONPRD. Two fully independent
-deployments on `10.19.75.115`, both managed by systemd.
+Two fully independent deployments on `10.19.75.115`, both managed by
+systemd. FALCONPRD ran a single systemd-managed environment; this splits that
+into a promotable prod/test pair.
 
 ---
 
@@ -22,7 +23,7 @@ Two separate checkouts, two venvs, two `.env` files, two Postgres schemas.
 | | prod | test |
 |---|---|---|
 | Chat UI | `:8079` | `:8179` |
-| Ops console | `:8060` | `:8160` |
+| Ops console (loopback) | `:8060` | `:8160` |
 | MCP (internal) | `:8056` | `:8156` |
 | DB schema | `tt_vi_ippms_schema` | `tt_vi_ippms_schema_test` |
 | `IG_DB_SESSION_KEY` | `default` | `test` |
@@ -146,7 +147,8 @@ sudo systemctl restart instant-graph-mcp@test && sleep 10
 sudo systemctl restart talk-to-vi-ippms@test
 ```
 
-Exercise it at `http://10.19.75.115:8179/`. **Read the startup line** — see
+Exercise it at `http://10.19.75.115:8179/`. The ops console binds loopback —
+reach it with `ssh -L 8160:127.0.0.1:8160 you@10.19.75.115`. **Read the startup line** — see
 the checklist below.
 
 ### 3. Tag what you tested
