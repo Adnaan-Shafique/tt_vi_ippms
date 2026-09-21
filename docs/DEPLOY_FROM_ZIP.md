@@ -145,8 +145,8 @@ sudo dnf install -y squid                  # or: apt install squid
 sudo cp deploy/relay/squid-ig-relay.conf /etc/squid/conf.d/ig-relay.conf
 sudo squid -k parse                        # must print no errors
 sudo systemctl enable --now squid
-sudo firewall-cmd --permanent --add-port=3128/tcp
-sudo firewall-cmd --permanent --add-port=8071/tcp    # GPU proxy, for .115
+sudo firewall-cmd --permanent --add-port=3128/tcp    # squid relay
+sudo firewall-cmd --permanent --add-port=8071/tcp    # GPU proxy
 sudo firewall-cmd --reload
 ```
 
@@ -177,39 +177,43 @@ scp -r ~/ippms-transfer       you@10.19.75.115:/tmp/
 
 ## Phase 3 — Install on `10.19.75.115`
 
-### 3.0 Optional: can the corporate proxy reach the gateway?
+> **Why not the corporate proxy?** `10.94.147.19:8080` can reach the gateway
+> — it answers `200 Connection established` for `CONNECT 10.34.64.74:5001`.
+> We deliberately do not use it. It belongs to another team and was lent for
+> downloading Python packages; a production data path must not depend on
+> infrastructure we neither own nor get told about when it changes. The
+> gateway goes through FALCONPRD, which we control. The corporate proxy is
+> used for pip only, at install time, and never appears in a service env file.
 
-If you already have a corporate HTTP proxy, test whether it can CONNECT to
-the gateway. If it can, you do not need squid on FALCONPRD at all, and the
-gateway stops depending on `.246`:
+### 3.1 Verify both upstreams BEFORE building anything
+
+If either fails, stop — nothing else matters until they pass.
 
 ```bash
-# on .115
-curl -sv --max-time 10 --proxy http://10.94.147.19:8080 \
-     https://10.34.64.74:5001/api/api/v3/get-hosts 2>&1 | grep -E 'CONNECT|SSL|HTTP/'
+nc -vz 10.19.71.246 8071      # GPU proxy on FALCONPRD
 ```
 
-Many corporate proxies deny `CONNECT` to non-standard ports, so this will
-often fail with a `403` — the same restriction the squid config works around
-by whitelisting `5001`. Worth thirty seconds to find out: a `401` from the
-gateway means it worked, and you can set `HTTPS_PROXY` to the corporate proxy
-instead. The GPU proxy would still need FALCONPRD either way.
-
-### 3.1 Verify the relay works BEFORE building anything
-
-If this fails, stop — nothing else matters until it passes.
+For the gateway, `curl` cannot fully replicate the app's TLS setup: the cert
+is self-signed (needing `VERIFY_X509_PARTIAL_CHAIN`) and is reached by IP
+while its SAN is a DNS name. A curl `SSL certificate problem: unable to get
+local issuer certificate` therefore proves only that CONNECT worked — which
+is still the important half. Look for `200 Connection established`:
 
 ```bash
 curl -sv --max-time 10 --proxy http://10.19.71.246:3128 \
-     https://10.34.64.74:5001/api/api/v3/get-hosts 2>&1 \
-     | grep -E 'CONNECT|SSL|subject|HTTP/'
-
-nc -vz 10.19.71.246 8071      # GPU proxy
+     https://10.34.64.74:5001/api/api/v3/get-hosts 2>&1 | grep -E 'CONNECT|SSL|HTTP/'
 ```
 
-You want the CONNECT tunnel to establish and the TLS handshake to complete.
-**A `401` from the gateway is expected and fine** — you have no token yet.
-What you are proving is that the tunnel opens and the cert verifies.
+Once a venv exists (§3.4), verify properly — this mirrors the app's exact
+SSL context, pinning and proxy handling:
+
+```bash
+set -a; . /etc/ippms-assistant/ippms-prod.env; set +a
+/srv/ippms-assistant/prod/.venv/bin/python /srv/ippms-assistant/prod/deploy/check-gateway.py
+```
+
+**A `401` is a PASS** — TLS verified and the gateway answered; you simply have
+no token.
 
 ### 3.2 Create the user and unpack
 

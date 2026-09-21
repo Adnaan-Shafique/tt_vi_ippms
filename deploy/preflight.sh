@@ -43,13 +43,15 @@ fi
 echo; echo "── instant graph gateway (via relay) ───────────────────"
 if [[ -n "${HTTPS_PROXY:-}" ]]; then
     echo "     relay: $HTTPS_PROXY"
-    curl -sS --max-time 15 --proxy "$HTTPS_PROXY" --cacert "$IG_CA_BUNDLE" \
-         --connect-to "::${IG_CERT_HOSTNAME}:" -o /dev/null \
-         "${INSTANT_GRAPH_BASE_URL}/v3/get-hosts" 2>/dev/null \
-      && pass "CONNECT tunnel to gateway works, cert verified" \
-      || warn "tunnel/cert check inconclusive (a 401 without a token is EXPECTED and fine) — verify via the ops console"
-    curl -sS --max-time 10 --proxy "$HTTPS_PROXY" -o /dev/null "${INSTANT_GRAPH_BASE_URL}/" 2>/dev/null \
-      && pass "relay reachable" || fail "relay $HTTPS_PROXY unreachable from this host"
+    # Prefer the real check: it mirrors the app's SSL context and pinning,
+    # which curl cannot replicate (self-signed cert + IP-vs-SAN).
+    PY="$(dirname "$0")/../.venv/bin/python"
+    [[ -x "$PY" ]] || PY=python3
+    if "$PY" "$(dirname "$0")/check-gateway.py" 2>&1 | tail -1 | grep -q '^PASS'; then
+        pass "gateway reachable, TLS verified (app's own SSL context)"
+    else
+        fail "gateway check failed — run deploy/check-gateway.py for the reason"
+    fi
 else
     warn "HTTPS_PROXY unset — assuming autossh tunnel; checking 127.0.0.1:5001"
     (exec 3<>/dev/tcp/127.0.0.1/5001) 2>/dev/null && pass "tunnel listening" || fail "no relay and no tunnel — gateway is unreachable from .115"
