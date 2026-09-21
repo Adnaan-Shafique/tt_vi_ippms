@@ -1,0 +1,43 @@
+# /etc/systemd/system/talk-to-vi-ippms@.service
+#
+#  TEMPLATE UNIT — %i is the environment name: "prod" or "test".
+#    sudo systemctl enable --now talk-to-vi-ippms@prod
+#    sudo systemctl enable --now talk-to-vi-ippms@test
+#
+#  The chat UI. It is an MCP *client* and pre-lists the MCP server's tools at
+#  startup, so its matching instant-graph-mcp@%i must be up first.
+#
+#  NOTE: After= orders startup but does NOT wait for the MCP server to be
+#  READY to serve. RestartSec covers that race — if this starts a beat early
+#  it logs "Could not pre-list MCP tools" and the restart picks it up. That is
+#  why Restart=on-failure matters here rather than being boilerplate.
+
+[Unit]
+Description=Talk-to-VI-IPPMS chat UI (%i)
+Documentation=https://github.com/adnaan-shafique/tt_vi_ippms
+After=network-online.target instant-graph-mcp@%i.service
+Wants=network-online.target
+Requires=instant-graph-mcp@%i.service
+
+[Service]
+Type=simple
+User=ippms
+Group=ippms
+WorkingDirectory=/srv/ippms-assistant/%i
+EnvironmentFile=/srv/ippms-assistant/%i/.env
+ExecStart=/srv/ippms-assistant/%i/.venv/bin/python src/talk_to_vi_ippms_updated_6_7_2.py
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tt-vi-%i
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/ippms-assistant/%i
+
+[Install]
+WantedBy=multi-user.target
