@@ -60,6 +60,9 @@ security work around that unchanged core.
 - Secrets moved to `/etc/ippms-assistant/ippms-<env>.env`, outside the
   deployment directory, so a redeploy, rsync or `git clean` cannot touch them.
 - `docs/ENVIRONMENTS.md` — the prod/test layout and the promotion workflow.
+- `docs/STAGING_ON_FALCONPRD.md` — standing the repo up as the `test`
+  instance beside the existing live deployment on FALCONPRD, which validates
+  the units and env layout on a host where the networking already works.
 - `deploy/promote.sh` — deploys an existing, tested git tag to prod and
   restarts it in dependency order, with automatic rollback if either service
   fails to come up.

@@ -207,6 +207,8 @@ deploy/promote.sh v1.1.0        # deploys a tested tag to prod, auto-rollback
 deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
 ```
 
+Running it beside an existing deployment on FALCONPRD:
+**`docs/STAGING_ON_FALCONPRD.md`**.
 Setting this up on a new host from a zip: **`docs/DEPLOY_FROM_ZIP.md`**.
 Day-to-day environment layout and the acceptance checklist:
 **`docs/ENVIRONMENTS.md`**. Why it is shaped this way:
@@ -269,6 +271,7 @@ access, edit that set and restart.
 │       ├── squid-ig-relay.conf        ← CONNECT relay, runs on FALCONPRD
 │       └── autossh-ig-tunnel.service  ← fallback
 └── docs/
+    ├── STAGING_ON_FALCONPRD.md        ← run beside the live app on .246
     ├── DEPLOY_FROM_ZIP.md             ← START HERE on a new host
     ├── ENVIRONMENTS.md                ← prod/test layout + release cycle
     └── MIGRATION_10.19.75.115.md      ← FALCONPRD → 10.19.75.115 runbook
