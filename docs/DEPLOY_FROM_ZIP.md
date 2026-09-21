@@ -209,7 +209,7 @@ SSL context, pinning and proxy handling:
 
 ```bash
 set -a; . /etc/ippms-assistant/ippms-prod.env; set +a
-/srv/ippms-assistant/prod/.venv/bin/python /srv/ippms-assistant/prod/deploy/check-gateway.py
+/srv/ippms-assistant-v2/prod/.venv/bin/python /srv/ippms-assistant-v2/prod/deploy/check-gateway.py
 ```
 
 **A `401` is a PASS** — TLS verified and the gateway answered; you simply have
@@ -218,36 +218,37 @@ no token.
 ### 3.2 Create the user and unpack
 
 ```bash
-sudo useradd -r -m -d /srv/ippms-assistant -s /usr/sbin/nologin ippms
-sudo mkdir -p /srv/ippms-assistant/{prod,test,backups}
+# Matches FALCONPRD: service user with a normal home, deploy dir separate.
+sudo useradd -r -m -d /home/ippms -s /usr/sbin/nologin ippms
+sudo mkdir -p /srv/ippms-assistant-v2/{prod,test,backups}
 
 sudo unzip /tmp/tt_vi_ippms.zip -d /tmp/unpacked
 # GitHub zips nest everything under one folder — adjust the path if so:
-sudo cp -r /tmp/unpacked/*/. /srv/ippms-assistant/prod/
-sudo cp -r /tmp/unpacked/*/. /srv/ippms-assistant/test/
+sudo cp -r /tmp/unpacked/*/. /srv/ippms-assistant-v2/prod/
+sudo cp -r /tmp/unpacked/*/. /srv/ippms-assistant-v2/test/
 
-sudo chown -R ippms:ippms /srv/ippms-assistant
-sudo chmod +x /srv/ippms-assistant/{prod,test}/deploy/*.sh
+sudo chown -R ippms:ippms /srv/ippms-assistant-v2
+sudo chmod +x /srv/ippms-assistant-v2/{prod,test}/deploy/*.sh
 ```
 
 ### 3.3 Place the assets the zip did not carry
 
 ```bash
 for e in prod test; do
-  sudo cp /tmp/ippms-transfer/vi_ippms_tool_kb.md          /srv/ippms-assistant/$e/assets/
-  sudo cp /tmp/ippms-transfer/vi_ippms_question_guide.xlsx /srv/ippms-assistant/$e/assets/
-  sudo cp /tmp/ippms-transfer/ig_selfsigned.pem            /srv/ippms-assistant/$e/
+  sudo cp /tmp/ippms-transfer/vi_ippms_tool_kb.md          /srv/ippms-assistant-v2/$e/assets/
+  sudo cp /tmp/ippms-transfer/vi_ippms_question_guide.xlsx /srv/ippms-assistant-v2/$e/assets/
+  sudo cp /tmp/ippms-transfer/ig_selfsigned.pem            /srv/ippms-assistant-v2/$e/
 done
 
-sudo chown -R ippms:ippms /srv/ippms-assistant
-sudo chmod 640 /srv/ippms-assistant/{prod,test}/ig_selfsigned.pem
+sudo chown -R ippms:ippms /srv/ippms-assistant-v2
+sudo chmod 640 /srv/ippms-assistant-v2/{prod,test}/ig_selfsigned.pem
 ```
 
 ### 3.4 Virtualenvs
 
 ```bash
 for e in prod test; do
-  sudo -u ippms python3 -m venv /srv/ippms-assistant/$e/.venv
+  sudo -u ippms python3 -m venv /srv/ippms-assistant-v2/$e/.venv
 done
 ```
 
@@ -261,7 +262,7 @@ With direct PyPI access:
 
 ```bash
 for e in prod test; do
-  sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install \
+  sudo -u ippms /srv/ippms-assistant-v2/$e/.venv/bin/pip install \
        -r /tmp/ippms-transfer/falconprd-freeze.txt
 done
 ```
@@ -270,7 +271,7 @@ Through the corporate proxy:
 
 ```bash
 for e in prod test; do
-  sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install \
+  sudo -u ippms /srv/ippms-assistant-v2/$e/.venv/bin/pip install \
        --proxy http://10.94.147.19:8080 \
        -r /tmp/ippms-transfer/falconprd-freeze.txt
 done
@@ -280,7 +281,7 @@ From the wheelhouse (§1.4):
 
 ```bash
 for e in prod test; do
-  sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install \
+  sudo -u ippms /srv/ippms-assistant-v2/$e/.venv/bin/pip install \
        --no-index --find-links=/tmp/ippms-transfer/wheelhouse \
        -r /tmp/ippms-transfer/falconprd-freeze.txt
 done
@@ -290,7 +291,7 @@ Confirm `openpyxl` landed — `pandas.read_excel()` needs it, and losing it
 disables RAG *silently*:
 
 ```bash
-/srv/ippms-assistant/prod/.venv/bin/python -c "import openpyxl, pandas, dash, langgraph, mcp, psycopg2; print('all imports OK')"
+/srv/ippms-assistant-v2/prod/.venv/bin/python -c "import openpyxl, pandas, dash, langgraph, mcp, psycopg2; print('all imports OK')"
 ```
 
 ### 3.5 Database
@@ -318,7 +319,7 @@ Then create the **test** schema (its auth tables do not auto-create):
 ```bash
 psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
      -v schema=tt_vi_ippms_schema_test \
-     -f /srv/ippms-assistant/test/sql/setup_ig_auth_tables.sql
+     -f /srv/ippms-assistant-v2/test/sql/setup_ig_auth_tables.sql
 ```
 
 ### 3.6 Write the two `.env` files
@@ -326,7 +327,7 @@ psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
 ```bash
 sudo mkdir -p /etc/ippms-assistant
 for e in prod test; do
-  sudo cp /srv/ippms-assistant/$e/.env.example /etc/ippms-assistant/ippms-$e.env
+  sudo cp /srv/ippms-assistant-v2/$e/.env.example /etc/ippms-assistant/ippms-$e.env
   sudo chown ippms:ippms /etc/ippms-assistant/ippms-$e.env
   sudo chmod 600         /etc/ippms-assistant/ippms-$e.env
 done
@@ -345,10 +346,10 @@ GPU_API_KEY=<real>               # ►► no source fallback exists any more
 HTTPS_PROXY=http://10.19.71.246:3128
 NO_PROXY=127.0.0.1,localhost,10.19.71.246:8071,10.19.75.115
 GPU_PROXY_URL=http://10.19.71.246:8071/v1/infer
-IG_CA_BUNDLE=/srv/ippms-assistant/prod/ig_selfsigned.pem
+IG_CA_BUNDLE=/srv/ippms-assistant-v2/prod/ig_selfsigned.pem
 IG_CERT_HOSTNAME=ippms.vodafoneidea.com
-VI_TOOL_KB_PATH=/srv/ippms-assistant/prod/assets/vi_ippms_tool_kb.md
-VI_QUESTION_GUIDE_PATH=/srv/ippms-assistant/prod/assets/vi_ippms_question_guide.xlsx
+VI_TOOL_KB_PATH=/srv/ippms-assistant-v2/prod/assets/vi_ippms_tool_kb.md
+VI_QUESTION_GUIDE_PATH=/srv/ippms-assistant-v2/prod/assets/vi_ippms_question_guide.xlsx
 ```
 
 **test** — same, but change **all six**, and every path `prod` → `test`:
@@ -390,7 +391,7 @@ ssh -L 8060:127.0.0.1:8060 you@10.19.75.115     # then http://127.0.0.1:8060/
 ### 4.1 Automated preflight
 
 ```bash
-/srv/ippms-assistant/prod/deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
+/srv/ippms-assistant-v2/prod/deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
 ```
 
 Fix every `✗` before continuing.
@@ -400,7 +401,7 @@ Fix every `✗` before continuing.
 A foreground failure is readable; a systemd one is a journal hunt.
 
 ```bash
-cd /srv/ippms-assistant/prod
+cd /srv/ippms-assistant-v2/prod
 set -a; . ./.env; set +a
 sudo -u ippms -E .venv/bin/python src/instant_graph_mcp_server_v2_5.py
 ```
@@ -439,7 +440,7 @@ timeouts.
 ### 4.4 Chat app, in the foreground
 
 ```bash
-cd /srv/ippms-assistant/prod
+cd /srv/ippms-assistant-v2/prod
 set -a; . ./.env; set +a
 sudo -u ippms -E .venv/bin/python src/talk_to_vi_ippms_updated_6_7_2.py
 ```
@@ -478,7 +479,7 @@ single proof nothing was lost.
 Only once Phase 4 passes.
 
 ```bash
-sudo cp /srv/ippms-assistant/prod/deploy/*@.service /etc/systemd/system/
+sudo cp /srv/ippms-assistant-v2/prod/deploy/*@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 sudo systemctl enable --now ippms-mcp@prod && sleep 10
@@ -510,18 +511,18 @@ so until `.115` can reach a git remote, promote by directory instead:
 ```bash
 # 1. unpack the new version into test and restart it
 sudo -u ippms unzip -o /tmp/tt_vi_ippms-new.zip -d /tmp/new
-sudo -u ippms cp -r /tmp/new/*/. /srv/ippms-assistant/test/
+sudo -u ippms cp -r /tmp/new/*/. /srv/ippms-assistant-v2/test/
 sudo systemctl restart ippms-mcp@test && sleep 10
 sudo systemctl restart ippms-app@test
 
 # 2. verify at :8179 against the ENVIRONMENTS.md checklist
 
 # 3. back prod up, then copy test over it
-sudo tar czf /srv/ippms-assistant/backups/prod-$(date +%F-%H%M).tgz \
-     -C /srv/ippms-assistant prod
+sudo tar czf /srv/ippms-assistant-v2/backups/prod-$(date +%F-%H%M).tgz \
+     -C /srv/ippms-assistant-v2 prod
 sudo -u ippms rsync -a --delete \
      --exclude '.venv' --exclude 'assets' --exclude 'ig_selfsigned.pem' \
-     /srv/ippms-assistant/test/ /srv/ippms-assistant/prod/
+     /srv/ippms-assistant-v2/test/ /srv/ippms-assistant-v2/prod/
 sudo systemctl restart ippms-mcp@prod && sleep 10
 sudo systemctl restart ippms-app@prod
 ```

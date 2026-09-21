@@ -34,7 +34,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=ippms
 Group=ippms
-WorkingDirectory=/srv/ippms-assistant/%i
+WorkingDirectory=/srv/ippms-assistant-v2/%i
 
 # Secrets live here, NOT in this unit file (unit files are world-readable) and
 # NOT inside the deployment directory — so a redeploy, rsync or git clean can
@@ -42,7 +42,7 @@ WorkingDirectory=/srv/ippms-assistant/%i
 EnvironmentFile=/etc/ippms-assistant/ippms-%i.env
 Environment=PYTHONUNBUFFERED=1
 
-ExecStart=/srv/ippms-assistant/%i/.venv/bin/python src/instant_graph_mcp_server_v2_5.py
+ExecStart=/srv/ippms-assistant-v2/%i/.venv/bin/python src/instant_graph_mcp_server_v2_5.py
 
 Restart=always
 RestartSec=5s

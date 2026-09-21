@@ -213,13 +213,14 @@ Follow **`docs/ENVIRONMENTS.md`** for the full prod/test setup — checkouts,
 venvs, schemas, ports, systemd units. Summary:
 
 ```bash
-sudo useradd -r -m -d /srv/ippms-assistant -s /usr/sbin/nologin ippms
-sudo mkdir -p /srv/ippms-assistant/{prod,test,backups}
-sudo chown -R ippms:ippms /srv/ippms-assistant
+# Matches FALCONPRD: service user with a normal home, deploy dir separate.
+sudo useradd -r -m -d /home/ippms -s /usr/sbin/nologin ippms
+sudo mkdir -p /srv/ippms-assistant-v2/{prod,test,backups}
+sudo chown -R ippms:ippms /srv/ippms-assistant-v2
 
-sudo -u ippms git clone <repo-url> /srv/ippms-assistant/prod
-sudo -u ippms git clone <repo-url> /srv/ippms-assistant/test
-sudo -u ippms git -C /srv/ippms-assistant/prod checkout --detach v1.0.0
+sudo -u ippms git clone <repo-url> /srv/ippms-assistant-v2/prod
+sudo -u ippms git clone <repo-url> /srv/ippms-assistant-v2/test
+sudo -u ippms git -C /srv/ippms-assistant-v2/prod checkout --detach v1.0.0
 ```
 
 ### 5.1 Copy the assets git does not carry
@@ -229,16 +230,16 @@ Gitignored deliberately — binary data and a credential:
 ```bash
 # from 10.19.71.246, into BOTH environments
 for e in prod test; do
-  scp vi_ippms_tool_kb.md          ippms@10.19.75.115:/srv/ippms-assistant/$e/assets/
-  scp vi_ippms_question_guide.xlsx ippms@10.19.75.115:/srv/ippms-assistant/$e/assets/
-  scp /srv/ippms-assistant/ig_selfsigned.pem ippms@10.19.75.115:/srv/ippms-assistant/$e/
+  scp vi_ippms_tool_kb.md          ippms@10.19.75.115:/srv/ippms-assistant-v2/$e/assets/
+  scp vi_ippms_question_guide.xlsx ippms@10.19.75.115:/srv/ippms-assistant-v2/$e/assets/
+  scp /srv/ippms-assistant/ig_selfsigned.pem ippms@10.19.75.115:/srv/ippms-assistant-v2/$e/
 done
 ```
 
 ```bash
 # on .115 — the PEM must not be world-readable
-sudo chmod 640 /srv/ippms-assistant/{prod,test}/ig_selfsigned.pem
-sudo chown ippms:ippms /srv/ippms-assistant/{prod,test}/ig_selfsigned.pem
+sudo chmod 640 /srv/ippms-assistant-v2/{prod,test}/ig_selfsigned.pem
+sudo chown ippms:ippms /srv/ippms-assistant-v2/{prod,test}/ig_selfsigned.pem
 ```
 
 > **Missing-asset behaviour differs, and it matters:**
@@ -250,8 +251,8 @@ sudo chown ippms:ippms /srv/ippms-assistant/{prod,test}/ig_selfsigned.pem
 
 ```bash
 for e in prod test; do
-  sudo -u ippms python3 -m venv /srv/ippms-assistant/$e/.venv
-  sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install -r /tmp/falconprd-freeze.txt
+  sudo -u ippms python3 -m venv /srv/ippms-assistant-v2/$e/.venv
+  sudo -u ippms /srv/ippms-assistant-v2/$e/.venv/bin/pip install -r /tmp/falconprd-freeze.txt
 done
 ```
 
@@ -262,7 +263,7 @@ done
 
 ```bash
 psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
-     -v schema=tt_vi_ippms_schema_test -f /srv/ippms-assistant/test/sql/setup_ig_auth_tables.sql
+     -v schema=tt_vi_ippms_schema_test -f /srv/ippms-assistant-v2/test/sql/setup_ig_auth_tables.sql
 ```
 
 ### 5.4 `.env` per environment
@@ -270,7 +271,7 @@ psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
 ```bash
 sudo mkdir -p /etc/ippms-assistant
 for e in prod test; do
-  sudo cp /srv/ippms-assistant/$e/.env.example /etc/ippms-assistant/ippms-$e.env
+  sudo cp /srv/ippms-assistant-v2/$e/.env.example /etc/ippms-assistant/ippms-$e.env
   sudo chown ippms:ippms /etc/ippms-assistant/ippms-$e.env
   sudo chmod 600         /etc/ippms-assistant/ippms-$e.env
 done
@@ -285,10 +286,10 @@ GPU_API_KEY=<real>                             # ►► no source fallback any m
 HTTPS_PROXY=http://10.19.71.246:3128
 NO_PROXY=127.0.0.1,localhost,10.19.71.246:8071,10.19.75.115
 GPU_PROXY_URL=http://10.19.71.246:8071/v1/infer
-IG_CA_BUNDLE=/srv/ippms-assistant/prod/ig_selfsigned.pem
+IG_CA_BUNDLE=/srv/ippms-assistant-v2/prod/ig_selfsigned.pem
 IG_CERT_HOSTNAME=ippms.vodafoneidea.com
-VI_TOOL_KB_PATH=/srv/ippms-assistant/prod/assets/vi_ippms_tool_kb.md
-VI_QUESTION_GUIDE_PATH=/srv/ippms-assistant/prod/assets/vi_ippms_question_guide.xlsx
+VI_TOOL_KB_PATH=/srv/ippms-assistant-v2/prod/assets/vi_ippms_tool_kb.md
+VI_QUESTION_GUIDE_PATH=/srv/ippms-assistant-v2/prod/assets/vi_ippms_question_guide.xlsx
 ```
 
 For `ippms-test.env` change **all five** of `IG_DB_SCHEMA`, `IG_DB_SESSION_KEY`,
@@ -333,7 +334,7 @@ Do not install the services until a manual run works — a foreground failure is
 readable, a systemd one is a journal hunt.
 
 ```bash
-cd /srv/ippms-assistant/prod
+cd /srv/ippms-assistant-v2/prod
 set -a; . ./.env; set +a
 sudo -u ippms -E .venv/bin/python src/instant_graph_mcp_server_v2_5.py
 ```
@@ -365,7 +366,7 @@ see timeouts under load.
 ### 6.4 Chat app
 
 ```bash
-cd /srv/ippms-assistant/prod
+cd /srv/ippms-assistant-v2/prod
 set -a; . ./.env; set +a
 sudo -u ippms -E .venv/bin/python src/talk_to_vi_ippms_updated_6_7_2.py
 ```
@@ -481,7 +482,7 @@ Once a week of clean running has passed:
 |---|---|
 | Source host | `10.19.71.246` (FALCONPRD) — **stays up** |
 | Target host | `10.19.75.115` (also the Postgres host) |
-| Install path | `/srv/ippms-assistant/{prod,test}` |
+| Install path | `/srv/ippms-assistant-v2/{prod,test}` |
 | Env files | `/etc/ippms-assistant/ippms-{prod,test}.env` |
 | Service user | `ippms` |
 | Prod chat UI / ops | `:8079` published / `:8060` loopback |

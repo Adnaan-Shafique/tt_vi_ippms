@@ -11,7 +11,7 @@
 set -euo pipefail
 
 TAG="${1:-}"
-ROOT=/srv/ippms-assistant
+ROOT=/srv/ippms-assistant-v2
 PROD="$ROOT/prod"
 
 if [[ -z "$TAG" ]]; then

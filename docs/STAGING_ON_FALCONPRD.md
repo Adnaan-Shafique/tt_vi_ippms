@@ -35,22 +35,24 @@ The new instance avoids every one of those:
 | Chat UI | `:8179` |
 | Ops console | `:8160` |
 | MCP | `:8156` |
-| Code | `/srv/ippms-assistant/test/` |
-| venv | `/srv/ippms-assistant/test/.venv` |
+| Code | `/srv/ippms-assistant-v2/test/` |
+| venv | `/srv/ippms-assistant-v2/test/.venv` |
 | Env file | `/etc/ippms-assistant/ippms-test.env` |
 | DB schema | `tt_vi_ippms_schema_test` |
 
 systemd treats `ippms-mcp.service` and `ippms-mcp@test.service` as entirely
 separate units, so there is no name collision.
 
-> ### ⚠ Never run a recursive command at `/srv/ippms-assistant`
->
-> The live deployment is **flat in that directory**, and the new instance is a
-> subdirectory of it. So `chown -R`, `rsync --delete`, `chmod -R` or `rm -rf`
-> aimed at `/srv/ippms-assistant` will hit the running application.
->
-> **Every command below targets `/srv/ippms-assistant/test` explicitly.** Keep
-> it that way.
+The new instance lives in a **separate root**, `/srv/ippms-assistant-v2`, so
+nothing below ever writes inside the live deployment's directory. That is
+worth more than it looks: the live deployment is flat in
+`/srv/ippms-assistant`, so had the new instance been a subdirectory of it,
+any `chown -R`, `rsync --delete` or `rm -rf` aimed at the parent would have
+hit the running application. With separate roots, that class of mistake is
+not available.
+
+The only thing read from `/srv/ippms-assistant` is the assets in step 3 and
+the package list in step 4 — both copies, never moves.
 
 ---
 
@@ -65,12 +67,12 @@ Anything here, pick different ports and change them consistently in step 5.
 ## 2. Unpack the repo into a subdirectory
 
 ```bash
-sudo mkdir -p /srv/ippms-assistant/test
+sudo mkdir -p /srv/ippms-assistant-v2/{test,backups}
 sudo unzip /tmp/tt_vi_ippms.zip -d /tmp/unpacked
-sudo cp -r /tmp/unpacked/*/. /srv/ippms-assistant/test/
+sudo cp -r /tmp/unpacked/*/. /srv/ippms-assistant-v2/test/
 
-sudo chown -R ippms:ippms /srv/ippms-assistant/test     # ◄ note the /test
-sudo chmod +x /srv/ippms-assistant/test/deploy/*.sh
+sudo chown -R ippms:ippms /srv/ippms-assistant-v2
+sudo chmod +x /srv/ippms-assistant-v2/test/deploy/*.sh
 ```
 
 ## 3. Copy the assets from the live deployment
@@ -81,11 +83,11 @@ the live app is using them:
 ```bash
 sudo cp /srv/ippms-assistant/vi_ippms_tool_kb.md \
         /srv/ippms-assistant/vi_ippms_question_guide.xlsx \
-        /srv/ippms-assistant/test/assets/
-sudo cp /srv/ippms-assistant/ig_selfsigned.pem /srv/ippms-assistant/test/
+        /srv/ippms-assistant-v2/test/assets/
+sudo cp /srv/ippms-assistant/ig_selfsigned.pem /srv/ippms-assistant-v2/test/
 
-sudo chown -R ippms:ippms /srv/ippms-assistant/test
-sudo chmod 640 /srv/ippms-assistant/test/ig_selfsigned.pem
+sudo chown -R ippms:ippms /srv/ippms-assistant-v2/test
+sudo chmod 640 /srv/ippms-assistant-v2/test/ig_selfsigned.pem
 ```
 
 ## 4. Build the venv
@@ -93,24 +95,27 @@ sudo chmod 640 /srv/ippms-assistant/test/ig_selfsigned.pem
 A separate venv from the live one, so upgrading here cannot affect production.
 
 ```bash
-sudo -u ippms python3 -m venv /srv/ippms-assistant/test/.venv
-sudo -u ippms /srv/ippms-assistant/test/.venv/bin/pip install \
-     --proxy http://10.94.147.19:8080 \
-     -r /srv/ippms-assistant/venv-freeze.txt
-```
-
-If you have not captured the live versions yet:
+sudo -u ippms python3 -m venv /srv/ippms-assistant-v2/test/.venv
+First capture what the live app actually runs — from the **service's** venv,
+not whatever your shell has active:
 
 ```bash
-sudo -u ippms /srv/ippms-assistant/venv/bin/pip freeze > /tmp/live-freeze.txt
-# then install with -r /tmp/live-freeze.txt
+/srv/ippms-assistant/venv/bin/pip freeze > /tmp/live-freeze.txt
+```
+
+Then install the same set:
+
+```bash
+sudo -u ippms /srv/ippms-assistant-v2/test/.venv/bin/pip install \
+     --proxy http://10.94.147.19:8080 \
+     -r /tmp/live-freeze.txt
 ```
 
 Confirm, especially `openpyxl` — without it the question guide fails to load
 and RAG is disabled *silently*:
 
 ```bash
-/srv/ippms-assistant/test/.venv/bin/python -c \
+/srv/ippms-assistant-v2/test/.venv/bin/python -c \
   "import openpyxl,pandas,dash,langgraph,mcp,psycopg2;print('imports OK')"
 ```
 
@@ -137,9 +142,9 @@ DASH_PORT=8160
 VI_APP_PORT=8179
 
 # --- paths, now under test/ ---
-IG_CA_BUNDLE=/srv/ippms-assistant/test/ig_selfsigned.pem
-VI_TOOL_KB_PATH=/srv/ippms-assistant/test/assets/vi_ippms_tool_kb.md
-VI_QUESTION_GUIDE_PATH=/srv/ippms-assistant/test/assets/vi_ippms_question_guide.xlsx
+IG_CA_BUNDLE=/srv/ippms-assistant-v2/test/ig_selfsigned.pem
+VI_TOOL_KB_PATH=/srv/ippms-assistant-v2/test/assets/vi_ippms_tool_kb.md
+VI_QUESTION_GUIDE_PATH=/srv/ippms-assistant-v2/test/assets/vi_ippms_question_guide.xlsx
 ```
 
 **Leave these as the live file has them** — they are what makes FALCONPRD
@@ -166,7 +171,7 @@ Its two auth tables do not auto-create. Against the remote DB:
 ```bash
 psql -h 10.19.75.115 -U ig_app_user -d conv_ai_db \
      -v schema=tt_vi_ippms_schema_test \
-     -f /srv/ippms-assistant/test/sql/setup_ig_auth_tables.sql
+     -f /srv/ippms-assistant-v2/test/sql/setup_ig_auth_tables.sql
 ```
 
 No `psql` on FALCONPRD? Install `postgresql` (client only), or run the file
@@ -189,7 +194,7 @@ sudo firewall-cmd --reload
 ## 8. Verify before installing the units
 
 ```bash
-cd /srv/ippms-assistant/test
+cd /srv/ippms-assistant-v2/test
 set -a; . /etc/ippms-assistant/ippms-test.env; set +a
 
 .venv/bin/python deploy/check-gateway.py          # a 401 is a PASS
@@ -254,8 +259,8 @@ further — it means the new instance is driving the live MCP server.
 ## 10. Install the units
 
 ```bash
-sudo cp /srv/ippms-assistant/test/deploy/ippms-mcp@.service \
-        /srv/ippms-assistant/test/deploy/ippms-app@.service /etc/systemd/system/
+sudo cp /srv/ippms-assistant-v2/test/deploy/ippms-mcp@.service \
+        /srv/ippms-assistant-v2/test/deploy/ippms-app@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 sudo systemctl enable --now ippms-mcp@test && sleep 10
@@ -294,7 +299,7 @@ will already have been exercised here.
 sudo systemctl disable --now ippms-app@test ippms-mcp@test
 sudo rm /etc/systemd/system/ippms-{mcp,app}@.service
 sudo systemctl daemon-reload
-sudo rm -rf /srv/ippms-assistant/test          # ◄ the /test suffix is essential
+sudo rm -rf /srv/ippms-assistant-v2/test          # ◄ the /test suffix is essential
 sudo rm /etc/ippms-assistant/ippms-test.env
 ```
 

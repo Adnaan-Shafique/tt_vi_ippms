@@ -12,7 +12,7 @@ Two separate checkouts, two venvs, two `.env` files, two Postgres schemas.
 **Nothing is shared.** Restarting test cannot disturb prod.
 
 ```
-/srv/ippms-assistant/
+/srv/ippms-assistant-v2/
 ├── prod/                       ← detached at a release TAG, never a branch
 │   ├── .venv/  src/  assets/  ig_selfsigned.pem
 ├── test/                       ← tracks a branch; where you try things
@@ -55,23 +55,24 @@ tokens.
 ## One-time setup
 
 ```bash
-sudo useradd -r -m -d /srv/ippms-assistant -s /usr/sbin/nologin ippms
-sudo mkdir -p /srv/ippms-assistant/{prod,test,backups}
-sudo chown -R ippms:ippms /srv/ippms-assistant
+# Matches FALCONPRD: service user with a normal home, deploy dir separate.
+sudo useradd -r -m -d /home/ippms -s /usr/sbin/nologin ippms
+sudo mkdir -p /srv/ippms-assistant-v2/{prod,test,backups}
+sudo chown -R ippms:ippms /srv/ippms-assistant-v2
 
 # Two checkouts from the same remote
-sudo -u ippms git clone <repo-url> /srv/ippms-assistant/prod
-sudo -u ippms git clone <repo-url> /srv/ippms-assistant/test
+sudo -u ippms git clone <repo-url> /srv/ippms-assistant-v2/prod
+sudo -u ippms git clone <repo-url> /srv/ippms-assistant-v2/test
 
 # prod sits on a tag, never a branch — so "what is in prod" is unambiguous
-sudo -u ippms git -C /srv/ippms-assistant/prod checkout --detach v1.0.0
-sudo -u ippms git -C /srv/ippms-assistant/test checkout main
+sudo -u ippms git -C /srv/ippms-assistant-v2/prod checkout --detach v1.0.0
+sudo -u ippms git -C /srv/ippms-assistant-v2/test checkout main
 
 sudo mkdir -p /etc/ippms-assistant
 for e in prod test; do
-  sudo -u ippms python3 -m venv /srv/ippms-assistant/$e/.venv
-  sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install -r /srv/ippms-assistant/$e/requirements.txt
-  sudo cp /srv/ippms-assistant/$e/.env.example /etc/ippms-assistant/ippms-$e.env
+  sudo -u ippms python3 -m venv /srv/ippms-assistant-v2/$e/.venv
+  sudo -u ippms /srv/ippms-assistant-v2/$e/.venv/bin/pip install -r /srv/ippms-assistant-v2/$e/requirements.txt
+  sudo cp /srv/ippms-assistant-v2/$e/.env.example /etc/ippms-assistant/ippms-$e.env
   sudo chown ippms:ippms /etc/ippms-assistant/ippms-$e.env
   sudo chmod 600         /etc/ippms-assistant/ippms-$e.env
 done
@@ -81,7 +82,7 @@ Create the test schema (the auth tables do **not** auto-create):
 
 ```bash
 psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
-     -v schema=tt_vi_ippms_schema_test -f /srv/ippms-assistant/test/sql/setup_ig_auth_tables.sql
+     -v schema=tt_vi_ippms_schema_test -f /srv/ippms-assistant-v2/test/sql/setup_ig_auth_tables.sql
 ```
 
 Edit each `.env` — for `ippms-test.env` change **all five**:
@@ -102,7 +103,7 @@ VI_APP_PORT=8179
 Install the templated units:
 
 ```bash
-sudo cp /srv/ippms-assistant/prod/deploy/*@.service /etc/systemd/system/
+sudo cp /srv/ippms-assistant-v2/prod/deploy/*@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ippms-mcp@prod && sleep 10
 sudo systemctl enable --now ippms-app@prod
@@ -126,7 +127,7 @@ sudo systemctl restart ippms-mcp@test && sleep 10
 sudo systemctl restart ippms-app@test
 
 # what is in prod right now
-git -C /srv/ippms-assistant/prod describe --tags
+git -C /srv/ippms-assistant-v2/prod describe --tags
 ```
 
 ---
@@ -147,8 +148,8 @@ git checkout -b feature/my-change
 ### 2. Deploy to test
 
 ```bash
-sudo -u ippms git -C /srv/ippms-assistant/test pull origin main
-sudo -u ippms /srv/ippms-assistant/test/.venv/bin/pip install -r /srv/ippms-assistant/test/requirements.txt
+sudo -u ippms git -C /srv/ippms-assistant-v2/test pull origin main
+sudo -u ippms /srv/ippms-assistant-v2/test/.venv/bin/pip install -r /srv/ippms-assistant-v2/test/requirements.txt
 sudo systemctl restart ippms-mcp@test && sleep 10
 sudo systemctl restart ippms-app@test
 ```
@@ -169,7 +170,7 @@ Tag the exact commit you tested — do not tag, then push more commits.
 ### 4. Promote
 
 ```bash
-sudo -u ippms /srv/ippms-assistant/prod/deploy/promote.sh v1.1.0
+sudo -u ippms /srv/ippms-assistant-v2/prod/deploy/promote.sh v1.1.0
 ```
 
 The script refuses a nonexistent tag, refuses to clobber uncommitted edits on
@@ -186,7 +187,7 @@ journalctl -u ippms-app@prod -n 30 --no-pager | grep STARTUP
 ### Rollback
 
 ```bash
-sudo -u ippms /srv/ippms-assistant/prod/deploy/promote.sh v1.0.0
+sudo -u ippms /srv/ippms-assistant-v2/prod/deploy/promote.sh v1.0.0
 ```
 
 Promotion is just "check out a tag and restart", so rolling back is the same

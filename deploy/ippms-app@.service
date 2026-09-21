@@ -26,7 +26,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=ippms
 Group=ippms
-WorkingDirectory=/srv/ippms-assistant/%i
+WorkingDirectory=/srv/ippms-assistant-v2/%i
 
 EnvironmentFile=/etc/ippms-assistant/ippms-%i.env
 Environment=PYTHONUNBUFFERED=1
@@ -36,7 +36,7 @@ Environment=PYTHONUNBUFFERED=1
 # `if __name__ == "__main__"` (src/talk_to_vi_ippms_updated_6_7_2.py:6343), so
 # under a WSGI server that sweeper never starts and old conversations are
 # never purged. The tool KB, RAG index and table creation warm up there too.
-ExecStart=/srv/ippms-assistant/%i/.venv/bin/python src/talk_to_vi_ippms_updated_6_7_2.py
+ExecStart=/srv/ippms-assistant-v2/%i/.venv/bin/python src/talk_to_vi_ippms_updated_6_7_2.py
 
 Restart=always
 RestartSec=5s
