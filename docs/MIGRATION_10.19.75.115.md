@@ -183,8 +183,9 @@ Do this **on `.246`, before touching anything.** The running host is the only
 authoritative record of what actually works.
 
 ```bash
-# Exact dependency versions — "latest" may not resolve the same way today
-pip freeze > /tmp/falconprd-freeze.txt
+# Exact dependency versions — "latest" may not resolve the same way today.
+# Use the SERVICE's venv, not the one your shell has active.
+/srv/ippms-assistant/venv/bin/pip freeze > /tmp/falconprd-freeze.txt
 
 # The REAL runtime env of the live processes, plus the existing unit files.
 pgrep -af 'talk_to_vi_ippms|instant_graph_mcp'

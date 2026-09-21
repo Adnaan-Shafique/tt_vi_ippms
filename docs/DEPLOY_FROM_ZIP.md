@@ -70,7 +70,20 @@ sudo ps eww -p <pid>
 Keep that file. Anything in it that differs from `.env.example` is a real
 setting you would otherwise lose.
 
-### 1.2 Collect the assets the zip does not carry
+### 1.2 Collect the assets and the env file the zip does not carry
+
+The live env file is the real source of truth for your configuration — more
+complete than anything `ps` shows. It is `chmod 600` and owned by `ippms`, so
+it needs `sudo` to read:
+
+```bash
+sudo cp /etc/ippms-assistant/ippms.env ~/ippms-transfer/
+sudo chown $(id -un):$(id -gn) ~/ippms-transfer/ippms.env
+chmod 600 ~/ippms-transfer/ippms.env
+```
+
+It contains live credentials. Keep it `600`, do not paste it anywhere, and
+delete the transfer directory once the migration is done.
 
 ```bash
 mkdir -p ~/ippms-transfer
@@ -81,8 +94,12 @@ ls -la ~/ippms-transfer/
 
 ### 1.3 Capture exact dependency versions
 
+Use the **service's** venv, not whatever venv your shell has active — they
+are usually different, and freezing the wrong one gives you the wrong package
+set:
+
 ```bash
-pip freeze > ~/ippms-transfer/falconprd-freeze.txt
+/srv/ippms-assistant/venv/bin/pip freeze > ~/ippms-transfer/falconprd-freeze.txt
 ```
 
 ### 1.4 Build a wheelhouse if `.115` has no internet
@@ -100,7 +117,8 @@ environment) and carry it across:
 
 ```bash
 # on .246
-pip download -r ~/ippms-transfer/falconprd-freeze.txt -d ~/ippms-transfer/wheelhouse
+/srv/ippms-assistant/venv/bin/pip download \
+    -r ~/ippms-transfer/falconprd-freeze.txt -d ~/ippms-transfer/wheelhouse
 du -sh ~/ippms-transfer/wheelhouse
 ```
 
