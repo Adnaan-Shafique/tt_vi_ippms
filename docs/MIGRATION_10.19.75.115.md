@@ -192,12 +192,16 @@ pip freeze > /tmp/falconprd-freeze.txt
 # processes are stopped, or it is gone.
 pgrep -af 'talk_to_vi_ippms|instant_graph_mcp'
 for pid in $(pgrep -f 'talk_to_vi_ippms|instant_graph_mcp'); do
-    echo "--- $pid ---"; sudo tr '\0' '\n' < /proc/$pid/environ
+    echo "--- $pid ---"; sudo cat /proc/$pid/environ | tr '\0' '\n'
 done
 
 # Assets not in git
 ls -la vi_ippms_tool_kb.md vi_ippms_question_guide.xlsx /srv/ippms-assistant/ig_selfsigned.pem
 ```
+
+`sudo` must do the reading: `sudo tr ... < /proc/$pid/environ` fails with
+*Permission denied*, because the shell opens the redirect as your own user
+before `sudo` runs. `sudo ps eww -p <pid>` works too.
 
 The `/proc/<pid>/environ` step is the one to be careful about. A value
 overridden in your nohup shell but left at its source default in git is a

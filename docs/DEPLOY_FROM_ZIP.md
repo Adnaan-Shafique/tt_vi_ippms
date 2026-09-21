@@ -42,8 +42,20 @@ pgrep -af 'talk_to_vi_ippms|instant_graph_mcp'
 
 for pid in $(pgrep -f 'talk_to_vi_ippms|instant_graph_mcp'); do
     echo "=== $pid ==="
-    sudo tr '\0' '\n' < /proc/$pid/environ
+    sudo cat /proc/$pid/environ | tr '\0' '\n'
 done | tee ~/falconprd-live-env.txt
+```
+
+> `sudo` must do the **reading**. Writing it as
+> `sudo tr '\0' '\n' < /proc/$pid/environ` fails with *Permission denied*:
+> your shell opens the redirect as your own user before `sudo` ever runs, so
+> the elevation applies only to `tr`. Same trap with `>` into a root-owned
+> path.
+
+If `sudo cat` is still refused, `ps` reads the same data:
+
+```bash
+sudo ps eww -p <pid>
 ```
 
 Keep that file. Anything in it that differs from `.env.example` is a real
