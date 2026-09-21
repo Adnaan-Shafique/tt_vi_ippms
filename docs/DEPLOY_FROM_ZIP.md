@@ -102,15 +102,24 @@ set:
 /srv/ippms-assistant/venv/bin/pip freeze > ~/ippms-transfer/falconprd-freeze.txt
 ```
 
-### 1.4 Build a wheelhouse if `.115` has no internet
+### 1.4 Decide how `.115` will install packages
 
-`.115` cannot reach the Instant Graph gateway, so assume it cannot reach PyPI
-either. **Check first** — this determines whether you need this step:
+Three possibilities, in order of preference. **Check from `.115`**, not from
+FALCONPRD — reachability differs between the two hosts:
 
 ```bash
 # on .115
-curl -sS --max-time 10 https://pypi.org/simple/ -o /dev/null && echo "PyPI reachable" || echo "NO PyPI — wheelhouse needed"
+curl -sS --max-time 10 https://pypi.org/simple/ -o /dev/null && echo "direct PyPI OK"
+
+# via the corporate proxy, if you use one for pip
+curl -sS --max-time 10 --proxy http://10.94.147.19:8080 \
+     https://pypi.org/simple/ -o /dev/null && echo "proxied PyPI OK"
 ```
+
+If either works, skip the wheelhouse and install normally (§3.4), adding
+`--proxy http://10.94.147.19:8080` when that is how you reach PyPI.
+
+Only if **neither** works, build a wheelhouse on FALCONPRD:
 
 If PyPI is unreachable, build a wheelhouse on FALCONPRD (which has the working
 environment) and carry it across:
@@ -168,6 +177,24 @@ scp -r ~/ippms-transfer       you@10.19.75.115:/tmp/
 
 ## Phase 3 — Install on `10.19.75.115`
 
+### 3.0 Optional: can the corporate proxy reach the gateway?
+
+If you already have a corporate HTTP proxy, test whether it can CONNECT to
+the gateway. If it can, you do not need squid on FALCONPRD at all, and the
+gateway stops depending on `.246`:
+
+```bash
+# on .115
+curl -sv --max-time 10 --proxy http://10.94.147.19:8080 \
+     https://10.34.64.74:5001/api/api/v3/get-hosts 2>&1 | grep -E 'CONNECT|SSL|HTTP/'
+```
+
+Many corporate proxies deny `CONNECT` to non-standard ports, so this will
+often fail with a `403` — the same restriction the squid config works around
+by whitelisting `5001`. Worth thirty seconds to find out: a `401` from the
+gateway means it worked, and you can set `HTTPS_PROXY` to the corporate proxy
+instead. The GPU proxy would still need FALCONPRD either way.
+
 ### 3.1 Verify the relay works BEFORE building anything
 
 If this fails, stop — nothing else matters until it passes.
@@ -220,11 +247,27 @@ for e in prod test; do
 done
 ```
 
-With internet:
+> ⚠ **Do not source the service env file for these pip commands.** It sets
+> `HTTPS_PROXY` to the squid relay, which allows only the Instant Graph
+> gateway and will refuse PyPI with a `403`. The two proxies serve different
+> purposes: squid for the gateway at runtime, the corporate proxy for
+> packages at install time. Keep them apart.
+
+With direct PyPI access:
 
 ```bash
 for e in prod test; do
   sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install \
+       -r /tmp/ippms-transfer/falconprd-freeze.txt
+done
+```
+
+Through the corporate proxy:
+
+```bash
+for e in prod test; do
+  sudo -u ippms /srv/ippms-assistant/$e/.venv/bin/pip install \
+       --proxy http://10.94.147.19:8080 \
        -r /tmp/ippms-transfer/falconprd-freeze.txt
 done
 ```
