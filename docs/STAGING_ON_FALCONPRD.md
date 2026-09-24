@@ -198,13 +198,35 @@ DASH_HOST=127.0.0.1
 
 ## 6. Create the test schema
 
-Its two auth tables do not auto-create. Against the remote DB:
+Its two auth tables do not auto-create, and the **schema itself needs an
+admin role** — `ig_app_user` has no CREATE on the database, and Postgres
+checks that privilege before it checks existence, so even
+`CREATE SCHEMA IF NOT EXISTS` fails.
+
+First check how the prod schema is set up, then match it:
+
+```bash
+psql -h 10.19.75.115 -U ig_app_user -d conv_ai_db -c '\dn+ tt_vi_ippms_schema'
+```
+
+As an admin role, once:
+
+```bash
+psql -h 10.19.75.115 -U <admin> -d conv_ai_db -c \
+  'CREATE SCHEMA IF NOT EXISTS tt_vi_ippms_schema_test AUTHORIZATION ig_app_user;'
+```
+
+Then the tables, as the app user:
 
 ```bash
 psql -h 10.19.75.115 -U ig_app_user -d conv_ai_db \
      -v schema=tt_vi_ippms_schema_test \
      -f /srv/ippms-assistant-v2/test/sql/setup_ig_auth_tables.sql
+
+psql -h 10.19.75.115 -U ig_app_user -d conv_ai_db -c '\dt tt_vi_ippms_schema_test.*'
 ```
+
+Want `ig_auth_sessions` and `ig_auth_login_audit`.
 
 No `psql` on FALCONPRD? Install `postgresql` (client only), or run the file
 from `.115` where the server lives.

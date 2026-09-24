@@ -12,9 +12,28 @@
 --    diff this against your original setup_ig_auth_tables.sql from FALCONPRD
 --    before trusting it for production.
 --
---  Usage — stand up a new schema (e.g. the test environment):
---    psql -h 127.0.0.1 -U ig_app_user -d conv_ai_db \
---         -v schema=tt_vi_ippms_schema_test -f sql/setup_ig_auth_tables.sql
+--  ⚠ TWO STEPS — the schema itself needs a PRIVILEGED role.
+--
+--  The application user deliberately has no CREATE on the database, so it
+--  cannot create a schema. Postgres also checks that privilege BEFORE it
+--  checks existence, so `CREATE SCHEMA IF NOT EXISTS` still fails with
+--  "permission denied for database" rather than quietly doing nothing.
+--
+--  1. As an admin/superuser, once per environment:
+--
+--       psql -h <db-host> -U <admin> -d conv_ai_db -c \
+--         'CREATE SCHEMA IF NOT EXISTS tt_vi_ippms_schema_test AUTHORIZATION ig_app_user;'
+--
+--     AUTHORIZATION makes the app user the schema owner, so everything
+--     below — and the app's own CREATE TABLE IF NOT EXISTS at first
+--     startup — works without needing the admin again. (FALCONPRD's prod
+--     schema is instead owned by `postgres` with ig_app_user granted UC;
+--     either arrangement works, so match whichever your site uses.)
+--
+--  2. As ig_app_user, this file:
+--
+--       psql -h <db-host> -U ig_app_user -d conv_ai_db \
+--            -v schema=tt_vi_ippms_schema_test -f sql/setup_ig_auth_tables.sql
 -- ════════════════════════════════════════════════════════════════════════════
 
 \set schema :schema
@@ -23,7 +42,8 @@
   \set schema tt_vi_ippms_schema
 \endif
 
-CREATE SCHEMA IF NOT EXISTS :"schema";
+-- The schema is created by the admin step above, NOT here: this file is meant
+-- to run as the unprivileged application user.
 
 -- ── Persisted Instant Graph tokens (shared across worker processes) ─────────
 CREATE TABLE IF NOT EXISTS :"schema".ig_auth_sessions (
