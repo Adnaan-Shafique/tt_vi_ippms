@@ -54,21 +54,21 @@ else
     fail "cannot connect — check pg_hba.conf covers this host's source address"
 fi
 
-echo; echo "── instant graph gateway (via relay) ───────────────────"
-if [[ -n "${HTTPS_PROXY:-}" ]]; then
-    echo "     relay: $HTTPS_PROXY"
-    # Prefer the real check: it mirrors the app's SSL context and pinning,
-    # which curl cannot replicate (self-signed cert + IP-vs-SAN).
-    PY="$(dirname "$0")/../.venv/bin/python"
-    [[ -x "$PY" ]] || PY=python3
-    if "$PY" "$(dirname "$0")/check-gateway.py" 2>&1 | tail -1 | grep -q '^PASS'; then
-        pass "gateway reachable, TLS verified (app's own SSL context)"
-    else
-        fail "gateway check failed — run deploy/check-gateway.py for the reason"
-    fi
+echo; echo "── instant graph gateway ───────────────────────────────"
+# check-gateway.py is the authority in every case: it mirrors the app's own
+# SSL context, SAN pinning and proxy handling, which curl cannot replicate
+# (self-signed cert needing VERIFY_X509_PARTIAL_CHAIN, reached by IP while
+# the cert's SAN is a DNS name). It honours HTTPS_PROXY exactly as requests
+# does, so it covers relayed and direct hosts alike — do NOT infer the mode
+# from whether HTTPS_PROXY happens to be set. FALCONPRD reaches the gateway
+# directly and is correct with no proxy at all.
+echo "     route: ${HTTPS_PROXY:-direct (no proxy)}"
+PY="$(dirname "$0")/../.venv/bin/python"
+[[ -x "$PY" ]] || PY=python3
+if "$PY" "$(dirname "$0")/check-gateway.py" 2>&1 | tail -1 | grep -q '^PASS'; then
+    pass "gateway reachable, TLS verified (app's own SSL context)"
 else
-    warn "HTTPS_PROXY unset — assuming autossh tunnel; checking 127.0.0.1:5001"
-    (exec 3<>/dev/tcp/127.0.0.1/5001) 2>/dev/null && pass "tunnel listening" || fail "no relay and no tunnel — gateway is unreachable from .115"
+    fail "gateway unreachable or TLS failed — run deploy/check-gateway.py for the reason"
 fi
 
 echo; echo "── gpu inference proxy ─────────────────────────────────"
