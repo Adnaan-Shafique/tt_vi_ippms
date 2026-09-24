@@ -29,7 +29,40 @@ The tag is what gets deployed — see `docs/ENVIRONMENTS.md`.
 
 ## [Unreleased]
 
-Nothing yet.
+Work towards **roles, an SME approval workflow and an admin analytics
+dashboard**. Being built and tested on the `test` environment only; prod on
+`:8079` is untouched.
+
+### Added
+- `config/roles.yaml` — admins and seed SMEs. Three roles now exist: `admin`
+  (glossary + approvals + dashboard), `sme` (glossary), `user` (default).
+  Admins are listed **only** in this file and cannot be granted through the
+  web UI: if they could, compromising one admin account would be enough to
+  make the compromise permanent.
+- `config/content.yaml` — user-facing copy that changes for wording reasons
+  rather than code reasons: welcome screen, capability cards, starter chips,
+  help text, and the SME-application wording.
+- `src/ippms_config.py` — loads and validates both files. A malformed edit
+  keeps the previously loaded config in force and logs the reason, so a typo
+  cannot take the assistant down or silently revoke everyone's access. Every
+  content key is optional and falls back to a built-in default.
+- Config is read per call rather than captured into module constants at
+  import, so an edit applies on reload without restarting the service.
+
+### Changed
+- The hardcoded `GLOSSARY_EDITORS` set is gone; `can_edit_glossary()` now
+  resolves through `role_for()`. **No one lost access** — the nine addresses in
+  that set are the six admins plus three seed SMEs in `roles.yaml`.
+- `HELP_TEXT` and `QUICK_QS` constants became the `help_text()` and
+  `quick_questions()` accessors; `welcome()` and the topbar brand read from
+  config. No wording changed.
+
+### Notes
+- `CIRCLE_TOKENS` and `KPI_SYNONYMS` were deliberately **not** moved to YAML.
+  They look like configuration but are matching logic the executor runs
+  against — editing them changes which devices an answer covers, so they stay
+  in code where they get reviewed as code.
+- New dependency: **PyYAML**.
 
 ---
 

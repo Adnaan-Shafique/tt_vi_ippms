@@ -13,6 +13,9 @@ mcp[cli]
 dash
 plotly
 
+# --- Config ---
+PyYAML            # config/roles.yaml + config/content.yaml (src/ippms_config.py)
+
 # --- Data ---
 pandas
 openpyxl          # required by pd.read_excel() for the question guide

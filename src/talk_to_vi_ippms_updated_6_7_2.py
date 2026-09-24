@@ -156,6 +156,10 @@ from langgraph.graph import StateGraph, END
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
+# Roles (admin / sme / user) and editable user-facing copy, both YAML-backed.
+# See src/ippms_config.py and config/*.yaml.
+import ippms_config
+
 
 
 
@@ -241,28 +245,25 @@ CHAT_HISTORY_RETENTION_DAYS  = int(os.environ.get("VI_CHAT_HISTORY_RETENTION_DAY
 CHAT_HISTORY_SWEEP_INTERVAL  = int(os.environ.get("VI_CHAT_HISTORY_SWEEP_INTERVAL", str(6 * 3600)))
 CHAT_HISTORY_MAX_CONVS       = int(os.environ.get("VI_CHAT_HISTORY_MAX_CONVS", "100"))
 
-# ── Glossary editors ─────────────────────────────────────────────────────────
-#  ►► TO GRANT OR REVOKE GLOSSARY ACCESS, EDIT THIS LIST ◄◄
+# ── Roles ────────────────────────────────────────────────────────────────────
+#  ►► TO GRANT OR REVOKE ACCESS, EDIT config/roles.yaml ◄◄
 #
-#  Only these people can add or edit glossary terms. Everyone else uses the
-#  assistant exactly as before — they simply don't see the "Add glossary term"
-#  button, and the submit callback refuses their writes even if the button is
-#  bypassed (a hidden button is not access control on its own, so this is
-#  checked server-side on both the open and the submit path).
+#  Three roles, resolved in src/ippms_config.py:
 #
-#  Entries are matched case-insensitively against the signed-in user's email,
-#  so the casing written here doesn't matter.
-GLOSSARY_EDITORS = {
-    "mohammed.shafique@vodafoneidea.com",
-    "devang.sheth@vodafoneidea.com",
-    "harish.saragadam@vodafoneidea.com",
-    "rahul.kulthe@vodafoneidea.com",
-    "amol.libe2@vodafoneidea.com",
-    "bhaskar.roy@vodafoneidea.com",
-    "apurva.singh2@vodafoneidea.com",
-    "vimal.atolia@vodafoneidea.com",
-    "vaibhav.patil@vodafoneidea.com",
-}
+#    admin  — everything an SME can do, plus the analytics dashboard and the
+#             power to approve SME applications. Listed in roles.yaml only,
+#             never grantable through the web UI.
+#    sme    — can add and edit glossary terms. Either seeded in roles.yaml, or
+#             approved at runtime by an admin.
+#    user   — the default. Sees "Apply for SME access" instead of the glossary
+#             form; otherwise uses the assistant exactly as before.
+#
+#  This replaces the hardcoded GLOSSARY_EDITORS set that used to live here. The
+#  nine people in that set kept their access: the six admins plus three seed
+#  SMEs in roles.yaml are the same nine addresses.
+#
+#  Roles are always re-checked server-side (see can_edit_glossary below, and
+#  every admin callback) — hiding a button is presentation, not access control.
 
 # Decode presets per graph role (mirrors gpu_llm_context.py).
 # SYNTHESIS is now temperature 0.0 (was 0.3): the query-spec engine makes the
@@ -1055,14 +1056,17 @@ def _ensure_retention_sweeper() -> None:
 #  this one can't disable chat logging or history.
 
 def can_edit_glossary(email: Optional[str]) -> bool:
-    """Is this user allowed to add/edit glossary terms? (see GLOSSARY_EDITORS)
+    """Is this user allowed to add/edit glossary terms? (see config/roles.yaml)
 
-    The list is normalized here on every call rather than once at import, so
-    editing GLOSSARY_EDITORS is genuinely the only thing anyone has to change
-    — there's no second, pre-computed copy to keep in sync. The list is a
-    handful of entries, so the cost is irrelevant."""
-    e = (email or "").strip().lower()
-    return bool(e) and e in {x.strip().lower() for x in GLOSSARY_EDITORS}
+    True for admins and SMEs alike. Kept as a named helper so the call sites
+    read the same as before — the only change is that the roster now comes from
+    YAML plus approved applications instead of a set literal in this file."""
+    return ippms_config.can_edit_glossary(email)
+
+
+def is_admin(email: Optional[str]) -> bool:
+    """Is this user an admin? (approvals queue + analytics dashboard)"""
+    return ippms_config.is_admin(email)
 
 
 _GLOSSARY_DDL = f"""
@@ -4115,7 +4119,7 @@ def spec_node(state: VIAgentState) -> VIAgentState:
 
 
 # ── Scope handling (§3.3): unrelated vs monitoring-shaped-but-unsupported ─────
-# Distinct, specific messages — neither is the generic HELP_TEXT.
+# Distinct, specific messages — neither is the generic help_text().
 
 _UNSUPPORTED_PATTERNS = [
     (r"\b(restart|reboot|bounce|shut\s?down|shutdown|disable|enable|turn (on|off))\b",
@@ -4297,21 +4301,19 @@ def synthesize_node(state: VIAgentState) -> VIAgentState:
     return {**state, "answer": _alt_note(state, ans)}
 
 
-HELP_TEXT = (
-    "I'm the Talk-to-VI-IPPMS assistant. I answer questions about your network "
-    "monitoring data using live APIs — no SQL. Try:\n"
-    "• Metadata: “How many devices are in the GUJ circle?”, “How many interfaces "
-    "on APVSPGJWPAR01HNE40?”, “List devices matching PAR01”, “How many KPIs are "
-    "tracked on that device?”\n"
-    "• KPI data: “On <device>, interface 100GE0/3/2, what was HC In Octets in the "
-    "last 6 hours?”, “min/max/avg traffic on Eth-Trunk1 yesterday”."
-)
+def help_text() -> str:
+    """The "what can you do?" reply. Editable in config/content.yaml.
+
+    Read through the accessor on every call rather than captured into a module
+    constant at import, so "Reload config" on the admin dashboard takes effect
+    without restarting the service."""
+    return ippms_config.content("help_text")
 
 
 def help_node(state: VIAgentState) -> VIAgentState:
     dbg = _dbg(state)
     dbg["answered_via"] = "help"
-    return {**state, "result_kind": "text", "answer": HELP_TEXT,
+    return {**state, "result_kind": "text", "answer": help_text(),
             "answered_via": "help", "debug": dbg}
 
 
@@ -4620,7 +4622,7 @@ def build_params_view(state: VIAgentState) -> List[Dict[str, str]]:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Two distinct situations get a "notice" + a row of clickable follow-up chips
 #  in the reply, reusing the SAME {"type": "quickq", ...} pattern-matched
-#  button id the welcome-screen QUICK_QS chips already use — clicking one just
+#  button id the welcome-screen starter chips already use — clicking one just
 #  sends that text as the next question, no new callback needed:
 #
 #   1. "incomplete" — the pipeline itself asked for more information: a
@@ -4792,7 +4794,7 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
     # (not None/"") for every normal, successfully-recognized question — that
     # string is truthy in Python, so `if scope_verdict:` below fired on
     # literally every answer, not just unrelated/unsupported ones, showing
-    # the QUICK_QS example chips on every single message. Only "unrelated"
+    # the starter example chips on every single message. Only "unrelated"
     # and "unsupported" (the two values scope_check() actually returns) mean
     # the question was out of scope.
     scope_verdict = dbg.get("scope_verdict")
@@ -4810,7 +4812,7 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
     notice: Optional[str] = None
     suggestions: List[Dict[str, str]] = []
     if out_of_scope:
-        suggestions = [{"label": (eq[:30] + "…") if len(eq) > 30 else eq, "q": eq} for eq in QUICK_QS]
+        suggestions = [{"label": (eq[:30] + "…") if len(eq) > 30 else eq, "q": eq} for eq in quick_questions()]
     elif answered_via == "help":
         pass
     elif kind == "text" and (answered_via == "query_spec" or state.get("failed")):
@@ -4863,12 +4865,12 @@ ROUTE_LABEL = {"metadata_q": "METADATA", "kpi_q": "KPI DATA",
 ROUTE_COLOR = {"metadata_q": "#22d3ee", "kpi_q": "#34d399",
                "help_q": "#a78bfa", "out_of_scope": "#f87171"}
 
-QUICK_QS = [
-    "How many devices are in the GUJ circle?",
-    "List devices matching PAR01",
-    "How many components on APVSPGJWPAR01HNE40?",
-    "How many KPIs are tracked on APVSPGJWPAR01HNE40?",
-]
+def quick_questions() -> List[str]:
+    """Starter chips on the welcome screen, and the fallback suggestions shown
+    after an unrelated question. Editable in config/content.yaml; read per call
+    so a config reload applies without a restart."""
+    return list(ippms_config.content("quick_questions") or [])
+
 
 app.index_string = """
 <!DOCTYPE html>
@@ -5206,23 +5208,21 @@ def av():
 
 
 def welcome():
+    """The empty-conversation screen. All of its copy — eyebrow, heading, intro,
+    the four capability cards and the starter chips — comes from
+    config/content.yaml, read per render so "Reload config" applies live.
+
+    A capability card carries its question in its own id, exactly like a starter
+    chip, so clicking one asks that question through the same callback."""
     caps = [
-        ("🗂️", "Device metadata", "Counts & listings of devices by circle or name pattern",
-         "How many devices are in the GUJ circle?"),
-        ("🔌", "Interfaces & components", "Interfaces / components / KPIs per device",
-         "How many interfaces on APVSPGJWPAR01HNE40?"),
-        ("📈", "KPI retrieval", "Values & statistics over a time window",
-         "min/max/avg HC In Octets on Interface 100GE0/3/2 in the last 6 hours"),
-        ("🧭", "Filter & slice", "Slice devices/KPIs by circle, component, threshold",
-         "List devices matching PAR01"),
+        (c.get("icon", ""), c.get("title", ""), c.get("description", ""), c.get("question", ""))
+        for c in (ippms_config.content("capabilities") or [])
+        if isinstance(c, dict) and c.get("question")
     ]
     return html.Div(className="welcome", children=[
-        html.Div("TALK TO VI-IPPMS", className="w-eye"),
-        html.Div("What would you like to know?", className="w-h"),
-        html.P("Ask in plain English. The agent routes through Router → Resolve → "
-               "QuerySpec → deterministic executor → Synthesize (falling back to a "
-               "ReAct tool loop only for unusual shapes), using live Instant Graph APIs.",
-               className="w-p"),
+        html.Div(ippms_config.content("welcome", "eyebrow"), className="w-eye"),
+        html.Div(ippms_config.content("welcome", "heading"), className="w-h"),
+        html.P(ippms_config.content("welcome", "intro"), className="w-p"),
         html.Div(className="cap-grid", children=[
             html.Div(className="cap", id={"type": "quickq", "src": "cap", "q": q}, n_clicks=0,
                      children=[
@@ -5231,7 +5231,7 @@ def welcome():
         ]),
         html.Div(className="chips", children=[
             html.Button(q, className="chip", id={"type": "quickq", "src": "chip", "q": q}, n_clicks=0)
-            for q in QUICK_QS
+            for q in quick_questions()
         ]),
     ])
 
@@ -5396,7 +5396,7 @@ def _debug_panel(debug: Dict[str, Any]):
 def _suggestions_panel(notice: Optional[str], suggestions: List[Dict[str, str]], index: int):
     """Notice + a row of clickable follow-up chips for an incomplete/ambiguous
     question or an empty result (§ user request). Chips reuse the exact
-    {"type": "quickq", ...} id pattern the welcome-screen QUICK_QS buttons
+    {"type": "quickq", ...} id pattern the welcome-screen starter buttons
     already use, so on_send already handles a click with no new callback."""
     if not suggestions:
         return None
@@ -5646,8 +5646,8 @@ def sidebar(convs, active_cid, email: str = ""):
         html.Button("＋  New conversation", id="new-conv", n_clicks=0, className="s-new"),
         html.Div(conv_items(convs, active_cid), id="conv-list-host", className="s-list"),
     ]
-    # Glossary editing is restricted (GLOSSARY_EDITORS), so the button is only
-    # rendered for those users. This is presentation only — open_glossary_modal
+    # Glossary editing is restricted to admins and SMEs (config/roles.yaml),
+    # so the button is only rendered for those users. This is presentation only — open_glossary_modal
     # and submit_glossary_term both re-check server-side, since a hidden button
     # stops nobody from issuing the callback request by hand.
     #
@@ -5666,8 +5666,8 @@ def main_page(email: str, convs, active_cid, messages, feedback, pending):
         html.Div(className="topbar", children=[
             html.Div(className="t-brand", children=[
                 html.Span("◈", className="t-icon", style={"color": "var(--cyan)"}),
-                html.Div([html.Div("Talk to VI-IPPMS", className="t-name"),
-                          html.Div("Instant Graph · conversational analytics", className="t-sub")]),
+                html.Div([html.Div(ippms_config.content("brand", "name"), className="t-name"),
+                          html.Div(ippms_config.content("brand", "tagline"), className="t-sub")]),
             ]),
             html.Div(className="t-right", children=[
                 html.Span([html.Span(className="live-dot"), "  live APIs"]),
@@ -6289,7 +6289,7 @@ def submit_glossary_term(_submit, _cancel, term, full_form, definition, aka, aut
     # The real authorization gate for writes. Hiding the sidebar button is
     # presentation only; this is what actually stops a non-editor's write,
     # including one issued by hand or left over from a stale open form after
-    # the GLOSSARY_EDITORS list changed.
+    # roles.yaml changed or an SME grant was revoked.
     if not can_edit_glossary(sess.get("email")):
         log.warning("[GLOSSARY] refused edit by unauthorized user %s", sess.get("email"))
         return no_update, html.Div(
@@ -6326,6 +6326,9 @@ def _warm_tools():
 
 
 def _warm_startup():
+    # First, so a broken roles.yaml is shouted about in the boot log rather
+    # than discovered by the first user who finds their button missing.
+    ippms_config.reload_config()
     _warm_tools()
     _load_question_guide()          # build the local RAG index (§4.2D)
     _ensure_logging_tables()        # best-effort create vi_chat_* tables (§3.5)
@@ -6340,6 +6343,9 @@ def _warm_startup():
              "ready" if _user_feedback_ready else "disabled",
              "ready" if _conversation_tables_ready else "disabled",
              "ready" if _glossary_ready else "disabled")
+    log.info("[STARTUP] roles: %d admin(s), %d seed SME(s) from %s",
+             len(ippms_config.admin_emails()), len(ippms_config.seed_sme_emails()),
+             ippms_config.CONFIG_DIR)
 
 
 if __name__ == "__main__":
