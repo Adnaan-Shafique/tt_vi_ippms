@@ -94,8 +94,32 @@ sudo chmod 640 /srv/ippms-assistant-v2/test/ig_selfsigned.pem
 
 A separate venv from the live one, so upgrading here cannot affect production.
 
+> ### ⚠ Build it with the SAME interpreter the live service uses
+>
+> `sudo` resets `PATH`, so `sudo -u ippms python3 -m venv` resolves to
+> `/usr/bin/python3` — on RHEL 8 that is **Python 3.6**, not whatever your
+> login shell has. A 3.6 venv installs nothing useful here (`langgraph` and
+> `mcp` need ≥3.10) and fails with a misleading
+> `No matching distribution found ... (from versions: )` from the ancient
+> pip 9.0.3 that 3.6 ships, rather than a clear "wrong Python" error.
+>
+> Derive the interpreter from the running service instead of trusting
+> `python3`:
+>
+> ```bash
+> LIVE_PY=$(readlink -f /srv/ippms-assistant/venv/bin/python)
+> echo "$LIVE_PY"          # FALCONPRD: /usr/bin/python3.12
+> "$LIVE_PY" --version     # FALCONPRD: Python 3.12.1
+> ```
+
 ```bash
-sudo -u ippms python3 -m venv /srv/ippms-assistant-v2/test/.venv
+sudo -u ippms "$LIVE_PY" -m venv /srv/ippms-assistant-v2/test/.venv
+/srv/ippms-assistant-v2/test/.venv/bin/python --version   # must match the live venv
+
+# pip 9 cannot resolve modern wheels; upgrade inside the venv first.
+# -H gives pip a writable cache (without it sudo keeps YOUR $HOME).
+sudo -H -u ippms /srv/ippms-assistant-v2/test/.venv/bin/pip install \
+     --proxy http://10.94.147.19:8080 --upgrade pip setuptools wheel
 First capture what the live app actually runs — from the **service's** venv,
 not whatever your shell has active:
 
@@ -106,13 +130,21 @@ not whatever your shell has active:
 Then install the same set:
 
 ```bash
-sudo -u ippms /srv/ippms-assistant-v2/test/.venv/bin/pip install \
+sudo -H -u ippms /srv/ippms-assistant-v2/test/.venv/bin/pip install \
      --proxy http://10.94.147.19:8080 \
      -r /tmp/live-freeze.txt
 ```
 
-Confirm, especially `openpyxl` — without it the question guide fails to load
-and RAG is disabled *silently*:
+Confirm. The strongest check is that the new environment is **package-identical**
+to what is serving production — an empty diff is the point of staging here:
+
+```bash
+diff <(/srv/ippms-assistant/venv/bin/pip freeze) \
+     <(/srv/ippms-assistant-v2/test/.venv/bin/pip freeze)
+```
+
+Then the imports, especially `openpyxl` — without it the question guide fails
+to load and RAG is disabled *silently*:
 
 ```bash
 /srv/ippms-assistant-v2/test/.venv/bin/python -c \

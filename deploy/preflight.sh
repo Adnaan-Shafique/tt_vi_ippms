@@ -23,6 +23,20 @@ echo; echo "── secrets ─────────────────�
 [[ -n "${IG_DB_PASSWORD:-}" ]] && pass "IG_DB_PASSWORD set" || fail "IG_DB_PASSWORD empty — no source fallback exists, DB calls will fail"
 [[ -n "${GPU_API_KEY:-}"   ]] && pass "GPU_API_KEY set"   || fail "GPU_API_KEY empty — no source fallback exists, LLM calls return \"\" SILENTLY"
 
+echo; echo "── python interpreter ──────────────────────────────────"
+PYBIN="$(dirname "$0")/../.venv/bin/python"
+if [[ -x "$PYBIN" ]]; then
+    PYVER="$("$PYBIN" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+    # langgraph and the mcp client both require >= 3.10. A venv built with a
+    # bare `sudo python3` picks up the system interpreter, which on RHEL 8 is
+    # 3.6 — it installs nothing useful and the pip error does not say why.
+    "$PYBIN" -c 'import sys;sys.exit(0 if sys.version_info[:2]>=(3,10) else 1)' \
+      && pass "venv python $PYVER" \
+      || fail "venv python is $PYVER — needs >= 3.10. Rebuild with the interpreter the live service uses: readlink -f <live-venv>/bin/python"
+else
+    warn "no venv at $PYBIN — skipping interpreter check"
+fi
+
 echo; echo "── on-disk assets ──────────────────────────────────────"
 [[ -r "${IG_CA_BUNDLE:-/nonexistent}" ]] && pass "CA bundle $IG_CA_BUNDLE" || fail "CA bundle missing — EVERY upstream call fails cert verification"
 [[ -r "${VI_TOOL_KB_PATH:-/nonexistent}" ]] && pass "tool KB" || fail "tool KB missing at ${VI_TOOL_KB_PATH:-unset}"

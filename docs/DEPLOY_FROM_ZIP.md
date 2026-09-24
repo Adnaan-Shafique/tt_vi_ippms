@@ -248,7 +248,7 @@ sudo chmod 640 /srv/ippms-assistant-v2/{prod,test}/ig_selfsigned.pem
 
 ```bash
 for e in prod test; do
-  sudo -u ippms python3 -m venv /srv/ippms-assistant-v2/$e/.venv
+  sudo -u ippms "$LIVE_PY" -m venv /srv/ippms-assistant-v2/$e/.venv
 done
 ```
 
