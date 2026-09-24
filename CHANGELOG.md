@@ -107,6 +107,35 @@ dashboard**. Being built and tested on the `test` environment only; prod on
   CSV exports the whole window. Six sections at sixty rows each made the tab
   ten thousand pixels tall, which is a log file, not a dashboard.
 
+### Added — glossary now changes answers
+- Glossary terms are matched against each question and their definitions are
+  injected into the router and synthesis prompts. The capture half has existed
+  since before this repo; this is the half that makes an SME's contribution
+  actually affect an answer.
+- **The question text is never rewritten.** Substituting `GJW` with
+  `Gujarat West` before parsing would corrupt the identifiers the executor
+  matches on — `APVSPGJWPAR01HNE40` contains `GJW`, and "matching PAR01" is a
+  plausible glossary term. Definitions ride alongside the original question.
+- Matching is word-boundary anchored, so an entry cannot fire on a substring of
+  a hostname; verified that `GJW` matches "devices in GJW" and does not match
+  "components on APVSPGJWPAR01HNE40".
+- A shorter term nested inside a longer match is suppressed, so a question
+  about `HC In Octets` is not also handed a generic `octets` definition.
+- Injection is capped at 6 definitions per question: the glossary is unbounded
+  and the local model's context is not, so a question that happens to contain
+  many known terms must not crowd out the retrieved data.
+- Matched once per run and reused by every node, so the router and the
+  synthesiser cannot see different definitions if an SME saves mid-run.
+- Saving a term drops the read cache, so an SME can add a definition and
+  immediately ask the question it applies to.
+
+### Changed — determinism
+- Identical questions can now legitimately differ over time, because the
+  glossary changed in between. This is the point of the feature, but it is
+  recorded rather than left mysterious: `glossary_version` and `glossary_terms`
+  columns on `vi_chat_interactions` make "why did this answer change?" a query.
+  Questions with no glossary match store NULL and `[]`.
+
 ### Fixed
 - The 🛡️ Admin button did nothing. Open and Close were one callback with two
   Inputs, and Dash will not fire a callback whose plain-id Input is absent from

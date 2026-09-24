@@ -239,12 +239,53 @@ pip install -r requirements.txt
 
 ---
 
-## Glossary editors
+## Roles
 
-Only the emails in `GLOSSARY_EDITORS` (near the top of the chat app) may add or
-edit glossary terms. This is enforced **server-side on both the open and the
-submit path** — a hidden button is not access control. To grant or revoke
-access, edit that set and restart.
+Three roles, resolved in `src/ippms_config.py`:
+
+| Role | Can do | Comes from |
+|---|---|---|
+| `admin` | everything an SME can, plus the analytics dashboard and approving SME applications | `config/roles.yaml` **only** |
+| `sme` | add and edit glossary terms | `config/roles.yaml`, or an admin's approval recorded in `vi_sme_requests` |
+| `user` | ask questions; can apply for SME access | the default — nobody needs listing to use the assistant |
+
+Admins are listed only in the YAML file and are deliberately **not** grantable
+through the web UI: if they were, compromising one admin account would be
+enough to make the compromise permanent. Runtime SME grants live in Postgres
+instead, because a grant is state — it has an approver and a timestamp, and it
+has to survive a deploy.
+
+Every check is enforced **server-side on both the open and the submit path** —
+a hidden button is not access control.
+
+To change the roster: edit `config/roles.yaml`, then either restart or press
+**Reload config** on the admin panel. A malformed file keeps the previous roles
+in force and logs the reason rather than revoking everyone's access.
+
+## Glossary
+
+SMEs record terms, abbreviations and business rules through the chat UI; those
+definitions are then injected into the router and synthesis prompts for any
+question that mentions them.
+
+**The question text is never rewritten.** Substituting `GJW` with
+`Gujarat West` before parsing would corrupt the identifiers the executor
+matches on — `APVSPGJWPAR01HNE40` contains `GJW`. Definitions travel
+*alongside* the original question, and matching is word-boundary anchored so a
+term cannot fire on a substring of a hostname.
+
+This does mean identical questions can legitimately differ over time as the
+glossary changes. Each interaction therefore records the `glossary_version` it
+was answered under and the `glossary_terms` that were injected, so:
+
+```sql
+SELECT id, asked_at, glossary_version, glossary_terms, answer
+  FROM tt_vi_ippms_schema.vi_chat_interactions
+ WHERE lower(btrim(question)) = lower('what is the MTTR for GJW')
+ ORDER BY asked_at;
+```
+
+answers "why did this change?" directly.
 
 ---
 

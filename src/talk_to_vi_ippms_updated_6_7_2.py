@@ -550,7 +550,13 @@ CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_chat_interactions (
     -- chips since long before this column existed, but not persisted — which
     -- left two of the dashboard's painpoint views unanswerable. NULL is the
     -- normal, healthy case.
-    notice        TEXT
+    notice        TEXT,
+    -- Which glossary this answer was produced under, and which of its terms
+    -- were actually injected. Wiring the glossary into answers means identical
+    -- questions can legitimately differ over time; these two columns are what
+    -- keep that explainable rather than spooky. NULL/0 = no glossary involved.
+    glossary_version BIGINT,
+    glossary_terms   JSONB
 );
 """
 _FEEDBACK_DDL = f"""
@@ -640,6 +646,10 @@ def _ensure_logging_tables() -> bool:
                 # so this is cheap even on the million-row prod history.
                 cur.execute(f"ALTER TABLE {DB_SCHEMA}.vi_chat_interactions "
                             f"ADD COLUMN IF NOT EXISTS notice TEXT")
+                cur.execute(f"ALTER TABLE {DB_SCHEMA}.vi_chat_interactions "
+                            f"ADD COLUMN IF NOT EXISTS glossary_version BIGINT")
+                cur.execute(f"ALTER TABLE {DB_SCHEMA}.vi_chat_interactions "
+                            f"ADD COLUMN IF NOT EXISTS glossary_terms JSONB")
                 cur.execute(_FEEDBACK_DDL)
             _logging_ready = True
             log.info("[STARTUP] chat interaction/feedback tables ready.")
@@ -691,8 +701,8 @@ def log_interaction(session_key: str, question: str, result: Dict[str, Any]) -> 
                 f"""INSERT INTO {DB_SCHEMA}.vi_chat_interactions
                     (session_key, question, route, confidence, entities, grounding,
                      query_spec, answered_via, fallback_used, tool_calls, answer,
-                     result_kind, latency_ms, notice)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                     result_kind, latency_ms, notice, glossary_version, glossary_terms)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                 (session_key, question, result.get("route"), result.get("confidence"),
                  json.dumps(dbg.get("entities"), default=str),
                  json.dumps(dbg.get("grounding_summary"), default=str),
@@ -701,7 +711,9 @@ def log_interaction(session_key: str, question: str, result: Dict[str, Any]) -> 
                  json.dumps(dbg.get("tool_calls"), default=str),
                  result.get("answer"), result.get("kind"),
                  int((result.get("timing", {}) or {}).get("total", 0) * 1000),
-                 result.get("notice")),
+                 result.get("notice"),
+                 result.get("glossary_version") or None,
+                 json.dumps(result.get("glossary_terms") or [], default=str)),
             )
             row = cur.fetchone()
             return int(row["id"]) if row else None
@@ -1163,10 +1175,166 @@ def upsert_glossary_term(term: str, full_form: str, definition: str,
             # updated by this statement — the standard way to tell an upsert's
             # two outcomes apart, used here only to word the confirmation.
             was_update = not bool(row and row.get("inserted"))
+            # Terms now change answers, so a stale read cache would mean an SME
+            # saves a definition, immediately asks the question it applies to,
+            # and sees it ignored. Drop the cache here rather than make them
+            # wait out its TTL.
+            _invalidate_glossary_cache()
             return True, was_update, ""
     except Exception as exc:
         log.warning("upsert_glossary_term failed for %r: %s", term, exc)
         return False, False, f"Could not save the term: {exc}"
+
+
+# ── Glossary retrieval + injection ───────────────────────────────────────────
+#  The capture half of the glossary has existed since 4B-3; this is the half
+#  that makes a term actually change an answer.
+#
+#  ►► THE QUESTION TEXT IS NEVER REWRITTEN. ◄◄
+#
+#  The obvious design — substitute "GJW" with "Gujarat West" before parsing —
+#  is a trap. Device and interface names are built out of exactly these tokens:
+#  APVSPGJWPAR01HNE40 contains GJW, and "List devices matching PAR01" contains
+#  a term someone could plausibly add to the glossary. Rewriting the question
+#  would corrupt the very identifiers the executor matches on, and it would do
+#  it silently. So matched definitions are passed to the LLM ALONGSIDE the
+#  original question, never in place of any part of it.
+#
+#  Matching is word-boundary anchored for the same reason: \bGJW\b does not
+#  match inside APVSPGJWPAR01HNE40, so a glossary entry cannot start firing on
+#  substrings of hostnames.
+#
+#  Determinism: this is a real trade. Identical questions asked months apart
+#  can now differ, because the glossary changed in between. That is the point
+#  of the feature, but it has to stay explainable — so every interaction
+#  records the glossary version it was answered under and which terms were
+#  injected (see log_interaction). "Why did this answer change?" is then a
+#  query, not an investigation.
+
+_GLOSSARY_CACHE_TTL = 60.0
+_glossary_cache: Tuple[float, int, List[Dict[str, Any]]] = (0.0, 0, [])
+_glossary_cache_lock = threading.Lock()
+
+# How many definitions may ride along with one question. A bound, not a
+# preference: the local model has a finite context and the glossary is
+# unbounded, so a question that happens to contain twenty known terms must not
+# crowd out the retrieved data it is supposed to be summarising.
+GLOSSARY_MAX_INJECTED = 6
+GLOSSARY_MIN_ALIAS_LEN = 2
+
+
+def _invalidate_glossary_cache() -> None:
+    global _glossary_cache
+    with _glossary_cache_lock:
+        _glossary_cache = (0.0, 0, [])
+
+
+def _glossary_snapshot() -> Tuple[int, List[Dict[str, Any]]]:
+    """(version, rows), cached briefly.
+
+    The version is the epoch second of the most recent updated_at, so any
+    insert or edit moves it and an unchanged glossary keeps a stable number.
+    0 means an empty or unreachable glossary."""
+    global _glossary_cache
+    now = time.time()
+    with _glossary_cache_lock:
+        stamp, ver, rows = _glossary_cache
+        if stamp and (now - stamp) < _GLOSSARY_CACHE_TTL:
+            return ver, rows
+    if not _ensure_glossary_table():
+        return 0, []
+    try:
+        with _log_cursor() as cur:
+            cur.execute(
+                f"""SELECT term, full_form, definition, also_known_as,
+                           EXTRACT(EPOCH FROM updated_at)::bigint AS updated_epoch
+                      FROM {DB_SCHEMA}.vi_glossary_terms""")
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        log.warning("glossary load failed (answers continue without it): %s", exc)
+        return 0, []
+    ver = max((int(r.get("updated_epoch") or 0) for r in rows), default=0)
+    with _glossary_cache_lock:
+        _glossary_cache = (time.time(), ver, rows)
+    return ver, rows
+
+
+def _glossary_aliases(row: Dict[str, Any]) -> List[str]:
+    """Every string that should trigger this entry: the term itself plus each
+    comma-separated also_known_as."""
+    out = [str(row.get("term") or "").strip()]
+    for a in str(row.get("also_known_as") or "").split(","):
+        a = a.strip()
+        if a:
+            out.append(a)
+    return [a for a in out if len(a) >= GLOSSARY_MIN_ALIAS_LEN]
+
+
+def match_glossary_terms(text: str) -> List[Dict[str, Any]]:
+    """Glossary entries whose term or an alias appears in `text` as a whole
+    word. Longest alias first, so "HC In Octets" wins over "octets" when both
+    are defined and both would match."""
+    if not text:
+        return []
+    _, rows = _glossary_snapshot()
+    if not rows:
+        return []
+    candidates: List[Tuple[int, str, Dict[str, Any]]] = []
+    for row in rows:
+        for alias in _glossary_aliases(row):
+            candidates.append((len(alias), alias, row))
+    candidates.sort(key=lambda c: -c[0])
+
+    matched: List[Dict[str, Any]] = []
+    seen_terms: Set[str] = set()
+    claimed: List[Tuple[int, int]] = []   # character spans already explained
+    for _, alias, row in candidates:
+        key = str(row.get("term") or "").lower()
+        if key in seen_terms:
+            continue
+        # (?<!\w) / (?!\w) rather than \b so aliases that start or end with a
+        # non-word character still anchor correctly.
+        pattern = r"(?<!\w)" + re.escape(alias) + r"(?!\w)"
+        try:
+            hits = [m.span() for m in re.finditer(pattern, text, re.IGNORECASE)]
+        except re.error:
+            continue
+        # Keep the entry only if it explains some text no longer alias already
+        # covers. Without this, a question mentioning "HC In Octets" also drags
+        # in a generic "octets" entry, and the model is handed two competing
+        # definitions of the same words — longest-first ordering is what makes
+        # skipping the shorter one the right call rather than an arbitrary one.
+        fresh = [(a, b) for a, b in hits
+                 if not any(a >= ca and b <= cb for ca, cb in claimed)]
+        if not fresh:
+            continue
+        matched.append(row)
+        seen_terms.add(key)
+        claimed.extend(fresh)
+        if len(matched) >= GLOSSARY_MAX_INJECTED:
+            break
+    return matched
+
+
+def build_glossary_context(text: str) -> Tuple[str, List[str]]:
+    """(prompt block, matched term names) for a question.
+
+    Returns ("", []) when nothing matches, so callers can append
+    unconditionally without producing a dangling empty heading."""
+    matched = match_glossary_terms(text)
+    if not matched:
+        return "", []
+    lines = []
+    for r in matched:
+        term = str(r.get("term") or "").strip()
+        full = str(r.get("full_form") or "").strip()
+        definition = str(r.get("definition") or "").strip()
+        head = f"{term} ({full})" if full else term
+        lines.append(f"- {head}: {definition}")
+    block = ("VI-IPPMS glossary — definitions your colleagues recorded for terms in "
+             "this question. Treat them as authoritative over your own assumptions, "
+             "and use this wording in your answer:\n" + "\n".join(lines))
+    return block, [str(r.get("term") or "").strip() for r in matched]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1980,6 +2148,13 @@ class VIAgentState(TypedDict):
     fallback_used: bool
     tool_calls:   int
     debug:        Dict[str, Any] # full per-run debug object (§3.2)
+    # Glossary definitions matched against this question, resolved once in
+    # run_agent and reused by every node that prompts the LLM — matching twice
+    # could otherwise give the router and the synthesiser different definitions
+    # if an SME saved a term mid-run.
+    glossary_block:   str
+    glossary_terms:   List[str]
+    glossary_version: int
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2457,6 +2632,11 @@ def router_node(state: VIAgentState) -> VIAgentState:
     user_prompt = f"Question: {q}"
     if rag:
         user_prompt += f"\n\n{rag}\n\n(Use the examples only as hints for route/target/metric.)"
+    # Appended, never substituted into the question — see the glossary
+    # injection notes in SECTION 4B-3. The question the router reads is the
+    # question the user typed.
+    if state.get("glossary_block"):
+        user_prompt += f"\n\n{state['glossary_block']}"
     raw = call_llm(ROUTER_SYSTEM, user_prompt, max_new_tokens=200,
                    decode=ROUTER_DECODE, stage="ROUTER")
     parsed = safe_json(raw)
@@ -4746,6 +4926,10 @@ def synthesize_node(state: VIAgentState) -> VIAgentState:
 
     user_p = (f"Question: {state['user_query']}\n\n"
               f"Retrieved data:\n{json.dumps(evidence, indent=2, default=str)[:2500]}")
+    # After the data, so a long glossary can never push the retrieved rows out
+    # of the model's attention — the data is what the answer must be built on.
+    if state.get("glossary_block"):
+        user_p += f"\n\n{state['glossary_block']}"
     ans = call_llm(SYNTH_SYSTEM, user_p, max_new_tokens=300,
                    decode=SYNTHESIS_DECODE, stage="SYNTH").strip()
     if not ans and state.get("answer"):
@@ -4840,7 +5024,19 @@ def run_agent(user_query: str, session_key: str) -> VIAgentState:
         "plan": "", "trace": [], "result_kind": "text", "payload": {},
         "answer": "", "answered_via": "", "failed": False, "fallback_used": False,
         "tool_calls": 0, "debug": {},
+        "glossary_block": "", "glossary_terms": [], "glossary_version": 0,
     }
+    # Best-effort: a glossary lookup must never be the reason a question fails.
+    try:
+        block, terms = build_glossary_context(user_query)
+        version, _ = _glossary_snapshot()
+        initial["glossary_block"] = block
+        initial["glossary_terms"] = terms
+        initial["glossary_version"] = version
+        if terms:
+            log.info("[GLOSSARY] injected %s for %r", terms, user_query[:60])
+    except Exception as exc:
+        log.warning("glossary context failed (answering without it): %s", exc)
     try:
         return vi_graph.invoke(initial)
     except Exception as exc:
@@ -5293,6 +5489,8 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
         "rows": rows, "cols": cols, "fig": fig_json, "stats": stats,
         "ts_rows": ts_rows, "ts_cols": ts_cols,
         "notice": notice, "suggestions": suggestions,
+        "glossary_version": state.get("glossary_version") or 0,
+        "glossary_terms": state.get("glossary_terms") or [],
         "plan": state.get("plan", ""),
         "trace": trace_view,
         "params": params_view,
