@@ -389,8 +389,8 @@ Run the six-question acceptance checklist in
 `docs/ENVIRONMENTS.md` at `http://10.19.75.115:8079/`, then confirm:
 
 ```sql
-SELECT count(*), max(created_at) FROM tt_vi_ippms_schema.vi_chat_interactions;
-SELECT count(*), max(created_at) FROM tt_vi_ippms_schema.ig_tool_call_audit;
+SELECT count(*), max(asked_at) FROM tt_vi_ippms_schema.vi_chat_interactions;
+SELECT count(*), max(called_at) FROM tt_vi_ippms_schema.ig_tool_call_audit;
 ```
 
 Both must be rising. Also open the sidebar and confirm your **old

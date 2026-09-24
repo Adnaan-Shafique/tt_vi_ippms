@@ -228,8 +228,8 @@ regression there is easy to introduce and easy to miss.
 Confirm side effects landed in the **test** schema:
 
 ```sql
-SELECT count(*), max(created_at) FROM tt_vi_ippms_schema_test.vi_chat_interactions;
-SELECT count(*), max(created_at) FROM tt_vi_ippms_schema_test.ig_tool_call_audit;
+SELECT count(*), max(asked_at) FROM tt_vi_ippms_schema_test.vi_chat_interactions;
+SELECT count(*), max(called_at) FROM tt_vi_ippms_schema_test.ig_tool_call_audit;
 ```
 
 If those counts stay flat while prod's rise, your test `.env` is pointing at

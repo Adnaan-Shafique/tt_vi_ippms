@@ -299,11 +299,11 @@ exercise:
 
 ```sql
 -- the NEW instance's rows land here
-SELECT count(*), max(created_at) FROM tt_vi_ippms_schema_test.vi_chat_interactions;
-SELECT count(*), max(created_at) FROM tt_vi_ippms_schema_test.ig_tool_call_audit;
+SELECT count(*), max(asked_at) FROM tt_vi_ippms_schema_test.vi_chat_interactions;
+SELECT count(*), max(called_at) FROM tt_vi_ippms_schema_test.ig_tool_call_audit;
 
 -- and the LIVE schema keeps only its own traffic
-SELECT count(*), max(created_at) FROM tt_vi_ippms_schema.vi_chat_interactions;
+SELECT count(*), max(asked_at) FROM tt_vi_ippms_schema.vi_chat_interactions;
 ```
 
 If your test questions appear in `tt_vi_ippms_schema` instead, `IG_DB_SCHEMA`
