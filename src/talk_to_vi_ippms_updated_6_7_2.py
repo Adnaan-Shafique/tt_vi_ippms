@@ -137,7 +137,7 @@ from contextlib import contextmanager
 from io import StringIO
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
 
 import requests
 import pandas as pd
@@ -1155,6 +1155,256 @@ def upsert_glossary_term(term: str, full_form: str, definition: str,
     except Exception as exc:
         log.warning("upsert_glossary_term failed for %r: %s", term, exc)
         return False, False, f"Could not save the term: {exc}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4B-4 — SME ACCESS REQUESTS  (apply -> admin approves -> role granted)
+# ══════════════════════════════════════════════════════════════════════════════
+#  A normal user applies for SME access; an admin approves or rejects it. An
+#  approved row IS the grant — role_for() consults this table on top of
+#  config/roles.yaml.
+#
+#  Why Postgres and not roles.yaml: a grant is state, not configuration. It has
+#  an applicant, a justification, an approver and two timestamps, and it must
+#  survive a deploy. Writing it back into a config file would lose the audit
+#  trail, need the app to hold write permission on its own configuration, drift
+#  between the test and prod copies, and be silently reverted by the next
+#  release. Admins stay in YAML for the opposite reason — see config/roles.yaml.
+#
+#  Rows are never deleted. Revoking access flips status to 'revoked' rather than
+#  removing the row, so "who had access in March, and who granted it?" stays
+#  answerable.
+#
+#  Best-effort like every other table here: if the database is unreachable the
+#  apply/approve flow degrades to an error message, and role resolution falls
+#  back to roles.yaml alone. Admins and seed SMEs never depend on this table.
+
+_SME_REQUESTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_sme_requests (
+    id            BIGSERIAL PRIMARY KEY,
+    email         TEXT NOT NULL,
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    justification TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','approved','rejected','revoked')),
+    decided_by    TEXT,
+    decided_at    TIMESTAMPTZ,
+    decision_note TEXT
+);
+"""
+# One open application per person, and one live grant per person. Partial
+# unique indexes rather than application-side checks: two rapid clicks on
+# Submit are two concurrent transactions, and only the database can settle
+# that race. Rejected and revoked rows are excluded from both, which is what
+# lets someone reapply after a rejection.
+_SME_REQUESTS_IDX_DDL = [
+    f"""CREATE UNIQUE INDEX IF NOT EXISTS ux_vi_sme_requests_pending
+        ON {DB_SCHEMA}.vi_sme_requests (lower(email)) WHERE status = 'pending';""",
+    f"""CREATE UNIQUE INDEX IF NOT EXISTS ux_vi_sme_requests_granted
+        ON {DB_SCHEMA}.vi_sme_requests (lower(email)) WHERE status = 'approved';""",
+    f"""CREATE INDEX IF NOT EXISTS ix_vi_sme_requests_status
+        ON {DB_SCHEMA}.vi_sme_requests (status, requested_at DESC);""",
+]
+
+_sme_ready = False
+_sme_ready_lock = threading.Lock()
+
+
+def _ensure_sme_tables() -> bool:
+    """Best-effort CREATE ... IF NOT EXISTS, independent of the other tables for
+    the same reason _ensure_user_feedback_table() is: a problem here must not
+    disable chat logging or history."""
+    global _sme_ready
+    if _sme_ready:
+        return True
+    with _sme_ready_lock:
+        if _sme_ready:
+            return True
+        if not DB_PASSWORD:
+            return False
+        try:
+            with _log_cursor(commit=True) as cur:
+                cur.execute(_SME_REQUESTS_DDL)
+                for ddl in _SME_REQUESTS_IDX_DDL:
+                    cur.execute(ddl)
+            _sme_ready = True
+            log.info("[STARTUP] SME request table ready.")
+            return True
+        except Exception as exc:
+            log.warning("Could not ensure vi_sme_requests (SME applications "
+                        "disabled; roles.yaml still applies): %s", exc)
+            return False
+
+
+# role_for() runs on every page render, so the grant lookup is cached rather
+# than hitting Postgres each time. The TTL is short and any approval decision
+# invalidates it immediately, so a newly approved SME sees their glossary
+# button on their next page load, not up to a minute later.
+_SME_GRANT_TTL = 30.0
+_sme_grant_cache: Tuple[float, Set[str]] = (0.0, set())
+_sme_grant_lock = threading.Lock()
+
+
+def _invalidate_sme_grants() -> None:
+    global _sme_grant_cache
+    with _sme_grant_lock:
+        _sme_grant_cache = (0.0, set())
+
+
+def approved_sme_emails() -> Set[str]:
+    """Emails with a live (status='approved') SME grant.
+
+    Registered with ippms_config as the grant provider. Once the table exists,
+    a database error propagates rather than being swallowed into an empty set:
+    empty is indistinguishable from "nobody is approved" and would silently
+    revoke every runtime grant. ippms_config catches it and falls back to
+    roles.yaml, so admins and seed SMEs are unaffected either way. The one case
+    that does return empty is a cold start with the database down, where no
+    grant is knowable at all."""
+    global _sme_grant_cache
+    now = time.time()
+    with _sme_grant_lock:
+        stamp, cached = _sme_grant_cache
+        if stamp and (now - stamp) < _SME_GRANT_TTL:
+            return cached
+    if not _ensure_sme_tables():
+        return set()
+    with _log_cursor() as cur:
+        cur.execute(f"SELECT lower(email) AS email FROM {DB_SCHEMA}.vi_sme_requests "
+                    f"WHERE status = 'approved'")
+        emails = {r["email"] for r in cur.fetchall()}
+    with _sme_grant_lock:
+        _sme_grant_cache = (time.time(), emails)
+    return emails
+
+
+def latest_sme_request(email: str) -> Optional[Dict[str, Any]]:
+    """The most recent application row for this person, whatever its status —
+    what the sidebar needs to decide between "Apply", "Pending" and showing a
+    rejection note. None if they have never applied (or the table is down)."""
+    e = (email or "").strip().lower()
+    if not e or not _ensure_sme_tables():
+        return None
+    try:
+        with _log_cursor() as cur:
+            cur.execute(
+                f"""SELECT id, email, requested_at, justification, status,
+                           decided_by, decided_at, decision_note
+                    FROM {DB_SCHEMA}.vi_sme_requests
+                    WHERE lower(email) = %s
+                    ORDER BY requested_at DESC LIMIT 1""", (e,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception as exc:
+        log.warning("latest_sme_request failed for %r: %s", e, exc)
+        return None
+
+
+def submit_sme_request(email: str, justification: str) -> Tuple[bool, str]:
+    """Record an application. Returns (ok, message-for-the-user).
+
+    Refused for people who already hold the access (admins and SMEs alike) —
+    not because it would break anything, but because an application from
+    someone who can already edit the glossary is pure noise in the queue."""
+    e = (email or "").strip().lower()
+    justification = (justification or "").strip()
+    if not e:
+        return False, "You need to be signed in to apply."
+    if ippms_config.can_edit_glossary(e):
+        return False, "You already have SME access."
+    if len(justification) < 20:
+        return False, ("Please say a little more about why you need SME access — "
+                       "an admin has to be able to act on it.")
+    if len(justification) > 2000:
+        return False, "That's longer than 2000 characters. Please shorten it."
+    if not _ensure_sme_tables():
+        return False, "The request database isn't reachable right now. Please try again later."
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""INSERT INTO {DB_SCHEMA}.vi_sme_requests (email, justification)
+                    VALUES (%s, %s) RETURNING id""", (e, justification))
+            cur.fetchone()
+        log.info("[SME] %s applied for SME access", e)
+        return True, ippms_config.content("sme_access", "submitted_toast")
+    except psycopg2.errors.UniqueViolation:
+        # The partial unique index on pending rows caught a double submit.
+        return False, "You already have an application waiting for review."
+    except Exception as exc:
+        log.warning("submit_sme_request failed for %r: %s", e, exc)
+        return False, f"Could not send the request: {exc}"
+
+
+def list_sme_requests(status: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    """Applications for the admin queue, newest first. status=None returns all."""
+    if not _ensure_sme_tables():
+        return []
+    try:
+        with _log_cursor() as cur:
+            if status:
+                cur.execute(
+                    f"""SELECT id, email, requested_at, justification, status,
+                               decided_by, decided_at, decision_note
+                        FROM {DB_SCHEMA}.vi_sme_requests WHERE status = %s
+                        ORDER BY requested_at DESC LIMIT %s""", (status, limit))
+            else:
+                cur.execute(
+                    f"""SELECT id, email, requested_at, justification, status,
+                               decided_by, decided_at, decision_note
+                        FROM {DB_SCHEMA}.vi_sme_requests
+                        ORDER BY requested_at DESC LIMIT %s""", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        log.warning("list_sme_requests failed: %s", exc)
+        return []
+
+
+def decide_sme_request(request_id: int, decision: str, admin_email: str,
+                       note: str = "") -> Tuple[bool, str]:
+    """Approve or reject a pending application, or revoke a live grant.
+
+    The caller must have already checked that admin_email is an admin; this is
+    re-asserted here anyway, because this is the function that actually changes
+    who can write to the glossary and it should not depend on every call site
+    remembering."""
+    decision = (decision or "").strip().lower()
+    if decision not in ("approved", "rejected", "revoked"):
+        return False, f"Unknown decision {decision!r}."
+    if not ippms_config.is_admin(admin_email):
+        log.warning("[SME] refused decision by non-admin %s on request %s",
+                    admin_email, request_id)
+        return False, "Only admins can decide SME applications."
+    if not _ensure_sme_tables():
+        return False, "The request database isn't reachable right now."
+    # Approving and rejecting act on a pending row; revoking acts on a live
+    # grant. Naming the expected current status in the WHERE clause makes each
+    # decision idempotent — a double-click updates one row, then zero.
+    expected = "approved" if decision == "revoked" else "pending"
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""UPDATE {DB_SCHEMA}.vi_sme_requests
+                    SET status = %s, decided_by = %s, decided_at = now(),
+                        decision_note = NULLIF(%s, '')
+                    WHERE id = %s AND status = %s
+                    RETURNING email""",
+                (decision, (admin_email or "").strip().lower(),
+                 (note or "").strip(), request_id, expected))
+            row = cur.fetchone()
+    except psycopg2.errors.UniqueViolation:
+        # Someone already holds a live grant for this address — two admins
+        # approving two applications from the same person at the same time.
+        return False, "That person already has an approved SME grant."
+    except Exception as exc:
+        log.warning("decide_sme_request failed for id=%s: %s", request_id, exc)
+        return False, f"Could not record the decision: {exc}"
+    if not row:
+        return False, ("That request is no longer %s — another admin may have "
+                       "already handled it." % expected)
+    _invalidate_sme_grants()
+    log.info("[SME] request %s for %s -> %s by %s",
+             request_id, row["email"], decision, admin_email)
+    return True, f"{row['email']} — {decision}."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5062,6 +5312,38 @@ app.index_string = """
         padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.55);}
     .fbm-title{font-size:15px;font-weight:700;margin-bottom:4px;}
     .fbm-sub{font-size:12px;color:var(--muted);margin:0 0 14px;}
+    .fbm-lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+        color:var(--muted);margin:4px 0 6px;}
+    /* admin panel */
+    .adm-backdrop{position:fixed;inset:0;background:rgba(5,8,14,.72);z-index:1200;
+        display:flex;align-items:flex-start;justify-content:center;overflow-y:auto;padding:4vh 16px;}
+    .adm-card{width:min(940px,100%);background:var(--panel);border:1px solid var(--line);
+        border-radius:12px;padding:20px 22px 26px;box-shadow:0 24px 70px rgba(0,0,0,.6);}
+    .adm-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;}
+    .adm-title{font-size:17px;font-weight:700;display:flex;align-items:center;}
+    .adm-notice{margin:10px 0 0;padding:9px 12px;border-radius:7px;font-size:12.5px;
+        background:rgba(34,211,238,.1);border:1px solid rgba(34,211,238,.3);color:var(--cyan);}
+    .adm-sec{margin-top:22px;}
+    .adm-sec-h{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);
+        margin-bottom:9px;font-weight:600;}
+    .adm-list{display:flex;flex-direction:column;gap:9px;}
+    .adm-row{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:11px 13px;}
+    .adm-row-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;}
+    .adm-email{font-size:13px;font-weight:600;}
+    .adm-when{font-size:11px;color:var(--muted);white-space:nowrap;}
+    .adm-just{font-size:12.5px;color:var(--text);margin:7px 0 10px;line-height:1.5;
+        white-space:pre-wrap;word-break:break-word;}
+    .adm-row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+    .adm-note{flex:1 1 220px;min-width:180px;padding:7px 10px;background:var(--panel);
+        border:1px solid var(--line);border-radius:6px;color:var(--text);font-size:12px;}
+    .adm-note:focus{outline:none;border-color:var(--cyan);}
+    .adm-btn-ok{padding:7px 15px;border-radius:6px;border:1px solid rgba(52,211,153,.45);
+        background:rgba(52,211,153,.14);color:var(--green);font-size:12px;font-weight:600;cursor:pointer;}
+    .adm-btn-no{padding:7px 15px;border-radius:6px;border:1px solid rgba(248,113,113,.45);
+        background:rgba(248,113,113,.12);color:var(--red);font-size:12px;font-weight:600;cursor:pointer;}
+    .adm-empty{font-size:12.5px;color:var(--muted);padding:10px 2px;}
+    .adm-yaml{font-size:12.5px;line-height:1.7;word-break:break-word;}
+    .adm-hint{font-size:11.5px;color:var(--muted);margin:9px 0 11px;line-height:1.55;}
     .fbm-textarea{width:100%;min-height:90px;background:var(--panel2);border:1px solid var(--line);
         border-radius:8px;color:var(--text);font-size:13px;font-family:'Inter',sans-serif;padding:10px 12px;
         resize:vertical;}
@@ -5592,6 +5874,147 @@ def glossary_modal():
     ])
 
 
+def sme_apply_modal(last_request=None):
+    """The "Apply for SME access" form, shown to users who cannot edit the
+    glossary. All of its copy comes from config/content.yaml.
+
+    If their previous application was rejected, the admin's note is shown above
+    the form rather than hidden — being told "no" without a reason is how people
+    end up reapplying with the same justification."""
+    rejected = (last_request or {}).get("status") == "rejected"
+    note = (last_request or {}).get("decision_note") or ""
+    header: List[Any] = [
+        html.Div(ippms_config.content("sme_access", "modal_title"), className="fbm-title"),
+        html.P(ippms_config.content("sme_access", "modal_blurb"), className="fbm-sub"),
+    ]
+    if rejected:
+        header.append(html.Div(className="fbm-err", children=[
+            html.B("Your previous request was not approved. "),
+            html.Span(note or "No reason was given."),
+        ]))
+    return html.Div(className="fbm-backdrop", children=[
+        html.Div(className="fbm-card", children=header + [
+            html.Div(ippms_config.content("sme_access", "justification_label"), className="fbm-lbl"),
+            dcc.Textarea(id="sme-justification", className="fbm-textarea",
+                         placeholder=ippms_config.content("sme_access", "justification_placeholder")),
+            html.Div(id="sme-error"),
+            html.Div(className="fbm-actions", children=[
+                html.Button("Cancel", id="sme-cancel", n_clicks=0, className="fbm-btn-ghost"),
+                html.Button("Send request", id="sme-submit", n_clicks=0, className="fbm-btn-primary"),
+            ]),
+        ]),
+    ])
+
+
+# ── Admin panel ──────────────────────────────────────────────────────────────
+#  A full-screen overlay rather than a third top-level view, so route_page's
+#  outputs and the "every Input must exist in the initial layout" constraint
+#  are left alone. Rendered only for admins, and every callback behind it
+#  re-checks that server-side.
+
+def _fmt_ts(ts: Any) -> str:
+    try:
+        return ts.strftime("%d %b %Y %H:%M")
+    except Exception:
+        return str(ts or "")
+
+
+def _sme_request_row(r: Dict[str, Any]) -> Any:
+    """One pending application: who, when, why, and the two decisions.
+
+    The note box is per row, not one shared box for the panel — an admin
+    rejecting two requests for different reasons should not have to think
+    about which box applies to which."""
+    rid = r["id"]
+    return html.Div(className="adm-row", children=[
+        html.Div(className="adm-row-head", children=[
+            html.Span(r["email"], className="mono adm-email"),
+            html.Span(_fmt_ts(r["requested_at"]), className="adm-when"),
+        ]),
+        html.Div(r["justification"], className="adm-just"),
+        html.Div(className="adm-row-actions", children=[
+            dcc.Input(id={"type": "sme-note", "id": rid}, type="text", className="adm-note",
+                      placeholder="Optional note — shown to them if you reject"),
+            html.Button("Approve", n_clicks=0, className="adm-btn-ok",
+                        id={"type": "sme-decide", "id": rid, "action": "approved"}),
+            html.Button("Reject", n_clicks=0, className="adm-btn-no",
+                        id={"type": "sme-decide", "id": rid, "action": "rejected"}),
+        ]),
+    ])
+
+
+def _sme_grant_row(r: Dict[str, Any]) -> Any:
+    """One live grant, with the audit trail that justified it."""
+    rid = r["id"]
+    by = r.get("decided_by") or "—"
+    return html.Div(className="adm-row", children=[
+        html.Div(className="adm-row-head", children=[
+            html.Span(r["email"], className="mono adm-email"),
+            html.Span(f"approved by {by} · {_fmt_ts(r.get('decided_at'))}", className="adm-when"),
+        ]),
+        html.Div(className="adm-row-actions", children=[
+            dcc.Input(id={"type": "sme-note", "id": rid}, type="text", className="adm-note",
+                      placeholder="Optional reason for revoking"),
+            html.Button("Revoke", n_clicks=0, className="adm-btn-no",
+                        id={"type": "sme-decide", "id": rid, "action": "revoked"}),
+        ]),
+    ])
+
+
+def admin_panel(notice: Optional[str] = None) -> Any:
+    """The admin surface: pending SME applications, who currently has access,
+    and a config reload.
+
+    Reads straight from Postgres and roles.yaml on every render, so it always
+    shows live state — there is no cached copy to go stale while an admin is
+    looking at it."""
+    pending = list_sme_requests("pending")
+    granted = list_sme_requests("approved")
+    admins = ippms_config.admin_emails()
+    seeds = ippms_config.seed_sme_emails()
+
+    return html.Div(className="adm-backdrop", children=[
+        html.Div(className="adm-card", children=[
+            html.Div(className="adm-head", children=[
+                html.Div([html.Span("🛡️  ", style={"fontSize": "17px"}), "Admin"],
+                         className="adm-title"),
+                html.Button("Close", id="admin-close-btn", n_clicks=0, className="fbm-btn-ghost"),
+            ]),
+            html.Div(notice, className="adm-notice") if notice else None,
+
+            html.Div(className="adm-sec", children=[
+                html.Div([f"Pending SME applications ({len(pending)})"], className="adm-sec-h"),
+                html.Div(className="adm-list", children=(
+                    [_sme_request_row(r) for r in pending] if pending
+                    else [html.Div("Nothing waiting for review.", className="adm-empty")]
+                )),
+            ]),
+
+            html.Div(className="adm-sec", children=[
+                html.Div([f"SME access granted here ({len(granted)})"], className="adm-sec-h"),
+                html.Div(className="adm-list", children=(
+                    [_sme_grant_row(r) for r in granted] if granted
+                    else [html.Div("No runtime grants yet — only the seeded SMEs below.",
+                                   className="adm-empty")]
+                )),
+            ]),
+
+            html.Div(className="adm-sec", children=[
+                html.Div("From config/roles.yaml", className="adm-sec-h"),
+                html.Div(className="adm-yaml", children=[
+                    html.Div([html.B("Admins: "), ", ".join(admins) or "none"]),
+                    html.Div([html.B("Seed SMEs: "), ", ".join(seeds) or "none"]),
+                    html.P("These are set in the file on the server and cannot be changed "
+                           "from here — that is deliberate. Edit config/roles.yaml and press "
+                           "Reload config.", className="adm-hint"),
+                    html.Button("Reload config", id="admin-reload-btn", n_clicks=0,
+                                className="fbm-btn-ghost"),
+                ]),
+            ]),
+        ]),
+    ])
+
+
 # ── Main app layout ──────────────────────────────────────────────────────────
 
 def _fmt_conv_meta(ts: Any) -> str:
@@ -5627,7 +6050,7 @@ def conv_items(convs, active_cid):
     return items
 
 
-def sidebar(convs, active_cid, email: str = ""):
+def sidebar(convs, active_cid, email: str = "", sme_request=None):
     """BUGFIX: the "New conversation" button must stay OUTSIDE the subtree
     that gets re-rendered when the conversation list/highlight changes.
 
@@ -5658,10 +6081,24 @@ def sidebar(convs, active_cid, email: str = ""):
         children.append(
             html.Button("📖  Add glossary term", id="glossary-add-btn", n_clicks=0,
                         className="s-new"))
+    else:
+        # Everyone else gets the way IN to that button instead of the button.
+        # Disabled while an application is waiting, so the queue does not fill
+        # with the same person clicking again — they can still reapply after a
+        # rejection, which is what latest_sme_request tells us here.
+        pending = (sme_request or {}).get("status") == "pending"
+        children.append(
+            html.Button(
+                ippms_config.content("sme_access", "pending_button" if pending else "apply_button"),
+                id="sme-apply-btn", n_clicks=0, className="s-new", disabled=pending))
+    if is_admin(email):
+        children.append(
+            html.Button("🛡️  Admin", id="admin-open-btn", n_clicks=0, className="s-new"))
     return html.Div(className="sidebar", children=children)
 
 
-def main_page(email: str, convs, active_cid, messages, feedback, pending):
+def main_page(email: str, convs, active_cid, messages, feedback, pending,
+              sme_request=None):
     return html.Div(className="shell", children=[
         html.Div(className="topbar", children=[
             html.Div(className="t-brand", children=[
@@ -5675,7 +6112,7 @@ def main_page(email: str, convs, active_cid, messages, feedback, pending):
                 html.Button("Sign out", id="logout-btn", n_clicks=0, className="logout"),
             ]),
         ]),
-        sidebar(convs, active_cid, email),
+        sidebar(convs, active_cid, email, sme_request),
         html.Div(className="main", children=[
             html.Div(className="scroll", children=[
                 html.Div(id="stream-host", children=render_stream(messages, feedback, pending))
@@ -5711,6 +6148,9 @@ app.layout = html.Div([
     dcc.Store(id="sfbmodal", storage_type="memory", data=None),   # {"index": <msg index>} or None
     dcc.Store(id="sdelmodal", storage_type="memory", data=None),  # {"cid":..., "title":...} or None
     dcc.Store(id="sglossary", storage_type="memory", data=None),  # True while the form is open
+    # None when closed; the user's latest application row (or {}) when open —
+    # the row is what the form needs to show a previous rejection note.
+    dcc.Store(id="ssme", storage_type="memory", data=None),
     dcc.Download(id="csv-dl"),
     html.Div(id="login-view", children=login_page(), style={"display": "block"}),
     html.Div(id="main-view", children=main_page("", [], None, [], {}, False), style={"display": "none"}),
@@ -5718,6 +6158,11 @@ app.layout = html.Div([
     html.Div(id="del-modal-host"),
     html.Div(id="glossary-modal-host"),
     html.Div(id="glossary-toast"),
+    html.Div(id="sme-modal-host"),
+    html.Div(id="sme-toast"),
+    # None when closed; a dict when open (carrying the last action's notice).
+    dcc.Store(id="sadmin", storage_type="memory", data=None),
+    html.Div(id="admin-modal-host"),
 ])
 
 
@@ -5755,7 +6200,12 @@ def route_page(auth, feedback):
         msgs = load_conversation_messages(active_cid, sess["email"])
     else:
         active_cid, msgs = None, []
-    main = main_page(sess["email"], convs, active_cid, msgs, feedback or {}, False)
+    # Only looked up for people who cannot already edit the glossary — an
+    # admin or SME never sees the apply button, so the query would be waste.
+    sme_request = (None if can_edit_glossary(sess["email"])
+                   else latest_sme_request(sess["email"]))
+    main = main_page(sess["email"], convs, active_cid, msgs, feedback or {}, False,
+                     sme_request)
     return (no_update, main, {"display": "none"}, {"display": "block"},
             msgs, convs, active_cid)
 
@@ -6230,6 +6680,179 @@ def confirm_delete_conversation(_ok, _cancel, convs, cid, msgs, feedback, auth):
             render_stream(new_msgs, feedback or {}, False), conv_items(convs, new_cid))
 
 
+# ── Admin panel (approvals queue + config reload) ────────────────────────────
+#  Every callback here re-checks is_admin() against the session. The sidebar
+#  only renders the button for admins, but that is presentation: the callbacks
+#  are reachable by hand.
+
+@app.callback(
+    Output("sadmin", "data"),
+    Input("admin-open-btn", "n_clicks"),
+    Input("admin-close-btn", "n_clicks"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def toggle_admin_panel(_open, _close, auth):
+    # The two buttons live in different places, so the usual combined
+    # insert-fire guard is wrong here: Close exists only once the panel is
+    # open, and its first appearance fires this callback while Open already
+    # has a non-zero count. Guarding on the pair would let that through and
+    # shut the panel the instant it rendered. Each button gets its own guard.
+    if ctx.triggered_id == "admin-close-btn":
+        return None if _close else no_update
+    if not _open:
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        log.warning("[ADMIN] refused panel open by %s", (sess or {}).get("email"))
+        return no_update
+    return {}
+
+
+@app.callback(
+    Output("admin-modal-host", "children"),
+    Input("sadmin", "data"),
+    State("sauth", "data"),
+)
+def render_admin_panel(data, auth):
+    if data is None:
+        return None
+    # Re-checked on render too: a stale store from a session whose role was
+    # revoked must not paint the panel.
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        return None
+    return admin_panel(data.get("notice"))
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input({"type": "sme-decide", "id": ALL, "action": ALL}, "n_clicks"),
+    State({"type": "sme-note", "id": ALL}, "value"),
+    State({"type": "sme-note", "id": ALL}, "id"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def decide_sme(n_clicks, note_values, note_ids, auth):
+    """Approve / reject / revoke. Re-rendering the panel afterwards is what
+    refreshes the lists, so there is no separate refresh step to forget."""
+    # Every button in the panel fires this at 0 the moment the panel is
+    # inserted — the same insert-fire the rest of the app guards against.
+    if not any(n_clicks or []):
+        return no_update
+    trigger = ctx.triggered_id
+    if not isinstance(trigger, dict):
+        return no_update
+
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        log.warning("[ADMIN] refused SME decision by %s", (sess or {}).get("email"))
+        return no_update
+
+    # Pair each note box with its row so the right note reaches the right
+    # decision — ALL preserves order, but matching on id is what makes that
+    # safe rather than merely true today.
+    notes = {i["id"]: (v or "") for i, v in zip(note_ids or [], note_values or [])}
+    ok, msg = decide_sme_request(trigger["id"], trigger["action"],
+                                 sess["email"], notes.get(trigger["id"], ""))
+    return {"notice": msg if ok else f"Could not do that — {msg}"}
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input("admin-reload-btn", "n_clicks"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def admin_reload_config(_n, auth):
+    """Re-read config/roles.yaml and config/content.yaml without a restart.
+
+    Reports per file, because they reload independently: a broken content.yaml
+    must not hide the fact that roles.yaml applied cleanly."""
+    if not _n:
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        log.warning("[ADMIN] refused config reload by %s", (sess or {}).get("email"))
+        return no_update
+    report = ippms_config.reload_config()
+    log.info("[ADMIN] config reloaded by %s: %s", sess["email"], report)
+    parts = []
+    for name in ("roles", "content"):
+        r = report.get(name, {})
+        if r.get("ok"):
+            extra = (f" — {r['admins']} admin(s), {r['smes']} seed SME(s)"
+                     if name == "roles" else "")
+            parts.append(f"{name}.yaml reloaded{extra}")
+        else:
+            parts.append(f"{name}.yaml FAILED ({r.get('error')}) — previous version kept")
+    return {"notice": " · ".join(parts)}
+
+
+# ── SME access requests (sidebar 🙋 -> form -> vi_sme_requests) ───────────────
+
+@app.callback(
+    Output("ssme", "data"),
+    Input("sme-apply-btn", "n_clicks"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def open_sme_modal(_n, auth):
+    # n_clicks == 0 means the button was just (re)inserted by a page rebuild,
+    # not pressed — same guard as new_conv/do_logout.
+    if not _n:
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess:
+        return no_update
+    # Someone who can already edit the glossary has nothing to apply for.
+    # Re-checked here rather than trusting the sidebar to have hidden it.
+    if can_edit_glossary(sess.get("email")):
+        return no_update
+    row = latest_sme_request(sess["email"]) or {}
+    # Timestamps are not JSON-serialisable and the form does not use them.
+    return {k: v for k, v in row.items() if k in ("status", "decision_note")}
+
+
+@app.callback(
+    Output("sme-modal-host", "children"),
+    Input("ssme", "data"),
+)
+def render_sme_modal(data):
+    return sme_apply_modal(data) if data is not None else None
+
+
+@app.callback(
+    Output("ssme", "data", allow_duplicate=True),
+    Output("sme-error", "children"),
+    Output("sme-toast", "children"),
+    Input("sme-submit", "n_clicks"),
+    Input("sme-cancel", "n_clicks"),
+    State("sme-justification", "value"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def submit_sme_apply(_submit, _cancel, justification, auth):
+    """Validate, record, and close. Same shape as submit_glossary_term: both
+    buttons exist the moment the modal is inserted, which fires this callback
+    with both at 0."""
+    if not (_submit or _cancel):
+        return no_update, no_update, no_update
+    if ctx.triggered_id == "sme-cancel":
+        return None, no_update, no_update
+
+    sess = session_get((auth or {}).get("token"))
+    if not sess:
+        return None, no_update, no_update
+
+    ok, msg = submit_sme_request(sess["email"], justification)
+    if not ok:
+        return no_update, html.Div(msg, className="fbm-err"), no_update
+    # Closing the modal leaves the sidebar button stale until the next page
+    # render; the toast is what tells them it landed.
+    return None, no_update, html.Div(msg, className="toast")
+
+
 # ── Glossary capture (sidebar 📖 -> form -> upsert) ───────────────────────────
 
 @app.callback(
@@ -6329,6 +6952,10 @@ def _warm_startup():
     # First, so a broken roles.yaml is shouted about in the boot log rather
     # than discovered by the first user who finds their button missing.
     ippms_config.reload_config()
+    # Runtime SME grants live in Postgres; roles.yaml alone knows nothing about
+    # them until this is wired up. Registered before anything can resolve a
+    # role, so there is no window where an approved SME reads as a normal user.
+    ippms_config.set_sme_grant_provider(approved_sme_emails)
     _warm_tools()
     _load_question_guide()          # build the local RAG index (§4.2D)
     _ensure_logging_tables()        # best-effort create vi_chat_* tables (§3.5)
@@ -6336,6 +6963,7 @@ def _warm_startup():
     _ensure_conversation_tables()   # best-effort create chat history tables, independently
     _ensure_retention_sweeper()     # start the 7-day retention purge thread
     _ensure_glossary_table()        # best-effort create vi_glossary_terms, independently
+    _ensure_sme_tables()            # best-effort create vi_sme_requests, independently
     log.info("[STARTUP] tool KB %s, question guide %d rows, logging %s, "
              "user_feedback %s, chat_history %s, glossary %s.",
              "loaded" if TOOL_KB_TEXT else "MISSING", len(_GUIDE_ROWS),
@@ -6343,6 +6971,7 @@ def _warm_startup():
              "ready" if _user_feedback_ready else "disabled",
              "ready" if _conversation_tables_ready else "disabled",
              "ready" if _glossary_ready else "disabled")
+    log.info("[STARTUP] SME applications %s.", "ready" if _sme_ready else "disabled")
     log.info("[STARTUP] roles: %d admin(s), %d seed SME(s) from %s",
              len(ippms_config.admin_emails()), len(ippms_config.seed_sme_emails()),
              ippms_config.CONFIG_DIR)

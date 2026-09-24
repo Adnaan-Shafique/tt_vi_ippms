@@ -57,6 +57,36 @@ dashboard**. Being built and tested on the `test` environment only; prod on
   `quick_questions()` accessors; `welcome()` and the topbar brand read from
   config. No wording changed.
 
+### Added — SME access requests
+- `vi_sme_requests` table: a normal user applies with a justification, an admin
+  approves, rejects or later revokes. An approved row **is** the grant, so
+  `role_for()` reads it alongside `roles.yaml`. Created best-effort at startup
+  like the other tables; `sql/setup_sme_requests.sql` is there for environments
+  where the app user cannot create tables.
+- Rows are never deleted — revoking flips the status — so "who had access in
+  March, and who granted it?" stays answerable.
+- Two partial unique indexes enforce one open application and one live grant
+  per person, in the database rather than in Python: two rapid clicks on Submit
+  are two concurrent transactions and only Postgres can settle that race.
+  Verified with 8 concurrent inserts (1 accepted, 7 rejected). Both indexes
+  exclude rejected and revoked rows, which is what lets someone reapply.
+- Sidebar now shows "Apply for SME access" to normal users, disabled while an
+  application is pending. A rejected applicant sees the admin's note, so they
+  do not reapply with the same justification.
+- Admin panel (🛡️ in the sidebar): the pending queue with per-row approve and
+  reject, live grants with revoke, the roles.yaml roster, and a **Reload
+  config** button that re-reads both YAML files without restarting the service.
+- Grant lookups are cached for 30s, invalidated immediately on any decision, so
+  a newly approved SME sees the glossary button on their next page load.
+
+### Security
+- Every admin and glossary callback re-checks the role server-side against the
+  session. Hiding a button is presentation; the callbacks are reachable by
+  hand. `decide_sme_request()` re-asserts admin even though its callers already
+  check, because it is the function that actually changes who can write.
+- A database outage degrades runtime grants to "not currently SME" and is
+  logged; admins and seed SMEs come from YAML and are never affected.
+
 ### Notes
 - `CIRCLE_TOKENS` and `KPI_SYNONYMS` were deliberately **not** moved to YAML.
   They look like configuration but are matching logic the executor runs
