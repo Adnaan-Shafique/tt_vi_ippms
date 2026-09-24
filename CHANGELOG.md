@@ -107,6 +107,15 @@ dashboard**. Being built and tested on the `test` environment only; prod on
   CSV exports the whole window. Six sections at sixty rows each made the tab
   ten thousand pixels tall, which is a log file, not a dashboard.
 
+### Fixed
+- The 🛡️ Admin button did nothing. Open and Close were one callback with two
+  Inputs, and Dash will not fire a callback whose plain-id Input is absent from
+  the current layout — `admin-close-btn` only exists once the panel is
+  rendered, so the callback could never fire: the panel could not open because
+  Close did not exist, and Close could not exist until the panel opened. Split
+  into separate open and close callbacks. Confirmed with a minimal Dash app:
+  combined never fires, split works.
+
 ### Security
 - Every admin and glossary callback re-checks the role server-side against the
   session. Hiding a button is presentation; the callbacks are reachable by

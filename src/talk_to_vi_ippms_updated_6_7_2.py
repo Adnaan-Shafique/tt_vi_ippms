@@ -7219,25 +7219,39 @@ def confirm_delete_conversation(_ok, _cancel, convs, cid, msgs, feedback, auth):
 @app.callback(
     Output("sadmin", "data"),
     Input("admin-open-btn", "n_clicks"),
-    Input("admin-close-btn", "n_clicks"),
     State("sauth", "data"),
     prevent_initial_call=True,
 )
-def toggle_admin_panel(_open, _close, auth):
-    # The two buttons live in different places, so the usual combined
-    # insert-fire guard is wrong here: Close exists only once the panel is
-    # open, and its first appearance fires this callback while Open already
-    # has a non-zero count. Guarding on the pair would let that through and
-    # shut the panel the instant it rendered. Each button gets its own guard.
-    if ctx.triggered_id == "admin-close-btn":
-        return None if _close else no_update
-    if not _open:
+def open_admin_panel(_n, auth):
+    """Open the panel.
+
+    Open and Close are two callbacks, not one with two Inputs, and that is not
+    a style choice. Dash will not fire a callback whose plain-id Input is
+    absent from the current layout, and admin-close-btn only exists once the
+    panel is rendered — so a combined callback could never fire at all: the
+    panel cannot open because Close does not exist, and Close cannot exist
+    until the panel opens. Splitting them is the fix.
+
+    (The three other multi-Input callbacks in this app are safe because their
+    Inputs appear together — both buttons of one modal, or the login form.)"""
+    # n_clicks == 0 means the sidebar was just rebuilt, not clicked.
+    if not _n:
         return no_update
     sess = session_get((auth or {}).get("token"))
     if not sess or not is_admin(sess.get("email")):
         log.warning("[ADMIN] refused panel open by %s", (sess or {}).get("email"))
         return no_update
     return {"tab": "requests", "days": 30}
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input("admin-close-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def close_admin_panel(_n):
+    # Fires once at 0 the moment the panel inserts this button; ignore that.
+    return None if _n else no_update
 
 
 @app.callback(
