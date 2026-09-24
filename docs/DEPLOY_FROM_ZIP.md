@@ -231,6 +231,62 @@ sudo chown -R ippms:ippms /srv/ippms-assistant-v2
 sudo chmod +x /srv/ippms-assistant-v2/{prod,test}/deploy/*.sh
 ```
 
+### 3.2b Let your own login account write to the deploy tree
+
+Skip this if you unpack the zip with `sudo` every time. Do it if you transfer
+files with MobaXterm's SFTP panel (drag-and-drop), which writes as **you**, not
+as root — against the `ippms:ippms` ownership set above, every drop fails with
+a permission error.
+
+The fix is group membership, not `chmod 777`. Replace `SNENRC` with your login
+account:
+
+```bash
+sudo usermod -aG ippms SNENRC
+
+# Group-own and group-write the tree. Capital X sets +x on directories only,
+# so it does not mark every .py file executable.
+sudo chgrp -R ippms /srv/ippms-assistant-v2
+sudo chmod -R g+rwX /srv/ippms-assistant-v2
+
+# setgid on directories: anything created inside inherits group ippms, so a
+# file you drop stays readable by the service.
+sudo find /srv/ippms-assistant-v2 -type d -exec chmod g+s {} +
+
+# Default ACL so new files are group-writable whatever your umask is. Without
+# it, files you create come out 644 — the service can read them, but the next
+# transfer cannot overwrite them cleanly.
+sudo setfacl -R  -m g:ippms:rwX /srv/ippms-assistant-v2
+sudo setfacl -R -d -m g:ippms:rwX /srv/ippms-assistant-v2
+```
+
+> **Log out of MobaXterm completely and reconnect before testing.**
+> `usermod -aG` only takes effect at login. Your existing session keeps the old
+> group list, so the transfer fails exactly as it did before and it looks like
+> the commands did nothing. They worked; the session is stale.
+
+Verify after reconnecting:
+
+```bash
+id | tr ',' '\n' | grep -i ippms      # ippms must appear
+touch /srv/ippms-assistant-v2/test/.wtest && rm /srv/ippms-assistant-v2/test/.wtest
+```
+
+`setfacl: command not found` → `sudo yum install -y acl`. If the filesystem has
+no ACL support, drop the `setfacl` lines and put `umask 002` in your
+`~/.bashrc` instead — same result, per-user rather than per-directory.
+
+**What this costs.** `/etc/ippms-assistant/ippms-*.env` is `640 root:ippms`, so
+joining the group means you can read the secrets without `sudo`. That grants
+*you* nothing you did not already have via `sudo`, but it does apply to anyone
+else added to the group later — so add people deliberately. `/etc/ippms-assistant`
+itself is left alone on purpose.
+
+**Do not drag over `.venv/`.** It is owned by `ippms` and built against a
+specific interpreter; overwriting it from Windows corrupts the symlinks. Drop
+`src/`, `config/`, `deploy/`, `docs/` and the top-level files only, then
+re-run the venv step if dependencies changed.
+
 ### 3.3 Place the assets the zip did not carry
 
 ```bash
@@ -243,6 +299,15 @@ done
 sudo chown -R ippms:ippms /srv/ippms-assistant-v2
 sudo chmod 640 /srv/ippms-assistant-v2/{prod,test}/ig_selfsigned.pem
 ```
+
+> If you did §3.2b, re-run these two lines after **every** drag-and-drop
+> transfer — an SFTP write replaces the file with your own ownership and a
+> default mode, quietly widening the cert's permissions:
+>
+> ```bash
+> sudo chgrp ippms /srv/ippms-assistant-v2/{prod,test}/ig_selfsigned.pem
+> sudo chmod 640   /srv/ippms-assistant-v2/{prod,test}/ig_selfsigned.pem
+> ```
 
 ### 3.4 Virtualenvs
 

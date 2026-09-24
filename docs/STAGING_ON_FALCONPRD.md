@@ -75,6 +75,29 @@ sudo chown -R ippms:ippms /srv/ippms-assistant-v2
 sudo chmod +x /srv/ippms-assistant-v2/test/deploy/*.sh
 ```
 
+If you update this tree by dragging files in over SFTP (MobaXterm's file
+panel) rather than unzipping with `sudo`, the ownership above blocks every
+write — the transfer runs as **you**, not as root. Grant your login account
+access through the service group once:
+
+```bash
+sudo usermod -aG ippms SNENRC          # your login account
+
+sudo chgrp -R ippms /srv/ippms-assistant-v2
+sudo chmod -R g+rwX /srv/ippms-assistant-v2
+sudo find /srv/ippms-assistant-v2 -type d -exec chmod g+s {} +
+sudo setfacl -R  -m g:ippms:rwX /srv/ippms-assistant-v2
+sudo setfacl -R -d -m g:ippms:rwX /srv/ippms-assistant-v2
+```
+
+**Then disconnect MobaXterm and reconnect** — `usermod -aG` only applies at
+login, so until you do, the transfer fails exactly as before and it looks
+like nothing happened. `id | grep ippms` after reconnecting confirms it.
+
+Full explanation, caveats and the fallback when `setfacl` is unavailable:
+`docs/DEPLOY_FROM_ZIP.md` §3.2b. Two to remember: never drag over `.venv/`,
+and re-tighten `ig_selfsigned.pem` after each transfer (below).
+
 ## 3. Copy the assets from the live deployment
 
 They are gitignored, so the zip does not contain them. Copy, do not move —
@@ -89,6 +112,10 @@ sudo cp /srv/ippms-assistant/ig_selfsigned.pem /srv/ippms-assistant-v2/test/
 sudo chown -R ippms:ippms /srv/ippms-assistant-v2/test
 sudo chmod 640 /srv/ippms-assistant-v2/test/ig_selfsigned.pem
 ```
+
+> Re-run those last two lines after any drag-and-drop transfer: an SFTP write
+> replaces the file with your ownership and a default mode, quietly widening
+> the certificate's permissions.
 
 ## 4. Build the venv
 
