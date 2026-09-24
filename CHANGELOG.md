@@ -79,6 +79,34 @@ dashboard**. Being built and tested on the `test` environment only; prod on
 - Grant lookups are cached for 30s, invalidated immediately on any decision, so
   a newly approved SME sees the glossary button on their next page load.
 
+### Added — admin dashboard
+- Two more tabs on the admin panel: **Usage** and **Painpoints**, over a
+  7/30/90-day or all-time window, with CSV export per table.
+- Usage: headline stat tiles (questions, people, downvote rate, fallback rate,
+  empty-answer rate, p95 latency), questions per day, how they were answered,
+  most-asked questions and who is using it.
+- Painpoints, worst-signal first: downvoted answers with the user's free text,
+  questions that fell back to the ReAct loop, empty or incomplete answers,
+  slowest questions, failing MCP tool calls, and errored answers.
+- `notice` column added to `vi_chat_interactions`. The value ('empty' /
+  'incomplete') was already computed for the UI's helper chips but never
+  persisted, which left two painpoint views unanswerable. Added with
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, which does not rewrite the table.
+- Nothing else new is instrumented: every other number comes from data the app
+  already wrote. If a metric is missing it is because it was never recorded.
+
+### Notes — dashboard design
+- No categorical palette is used. The app's existing `PAL` fails colourblind
+  separation against this surface (`#38bdf8`↔`#a78bfa` ΔE 5.2 deutan, and
+  `#34d399`↔`#22d3ee` ΔE 12.1 even with normal vision), so the dashboard was
+  designed not to need one: headline numbers are stat tiles, volume is a single
+  line, and `answered_via` is a one-hue bar where length alone carries the
+  message. `PAL` itself is untouched — the KPI charts users rely on are out of
+  scope here, but it is worth re-stepping before any new multi-series chart.
+- Painpoint tables show 12 rows with an honest "showing 12 of 26" count; the
+  CSV exports the whole window. Six sections at sixty rows each made the tab
+  ten thousand pixels tall, which is a log file, not a dashboard.
+
 ### Security
 - Every admin and glossary callback re-checks the role server-side against the
   session. Hiding a button is presentation; the callbacks are reachable by
@@ -86,6 +114,9 @@ dashboard**. Being built and tested on the `test` environment only; prod on
   check, because it is the function that actually changes who can write.
 - A database outage degrades runtime grants to "not currently SME" and is
   logged; admins and seed SMEs come from YAML and are never affected.
+- CSV export re-checks admin and maps the button to a fixed set of queries
+  rather than dispatching on the component id — a download of the full question
+  history is exactly what should not be reachable by guessing an id.
 
 ### Notes
 - `CIRCLE_TOKENS` and `KPI_SYNONYMS` were deliberately **not** moved to YAML.
