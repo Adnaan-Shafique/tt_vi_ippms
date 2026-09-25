@@ -1,5 +1,10 @@
 # Environments: test → prod
 
+> **First time moving production onto this repo?** That is a one-time
+> cutover from the old `/srv/ippms-assistant` deployment, not a
+> `promote.sh` run — see `docs/CUTOVER_TO_V2_PROD.md`. `promote.sh`
+> assumes prod is already a git checkout of this repo.
+
 Two fully independent deployments on `10.19.75.115`, both managed by
 systemd. FALCONPRD ran a single systemd-managed environment; this splits that
 into a promotable prod/test pair.
