@@ -137,7 +137,7 @@ from contextlib import contextmanager
 from io import StringIO
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
 
 import requests
 import pandas as pd
@@ -155,6 +155,10 @@ from langgraph.graph import StateGraph, END
 # MCP client (async) — used to reach the Instant Graph MCP server's tools.
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
+
+# Roles (admin / sme / user) and editable user-facing copy, both YAML-backed.
+# See src/ippms_config.py and config/*.yaml.
+import ippms_config
 
 
 
@@ -241,28 +245,25 @@ CHAT_HISTORY_RETENTION_DAYS  = int(os.environ.get("VI_CHAT_HISTORY_RETENTION_DAY
 CHAT_HISTORY_SWEEP_INTERVAL  = int(os.environ.get("VI_CHAT_HISTORY_SWEEP_INTERVAL", str(6 * 3600)))
 CHAT_HISTORY_MAX_CONVS       = int(os.environ.get("VI_CHAT_HISTORY_MAX_CONVS", "100"))
 
-# ── Glossary editors ─────────────────────────────────────────────────────────
-#  ►► TO GRANT OR REVOKE GLOSSARY ACCESS, EDIT THIS LIST ◄◄
+# ── Roles ────────────────────────────────────────────────────────────────────
+#  ►► TO GRANT OR REVOKE ACCESS, EDIT config/roles.yaml ◄◄
 #
-#  Only these people can add or edit glossary terms. Everyone else uses the
-#  assistant exactly as before — they simply don't see the "Add glossary term"
-#  button, and the submit callback refuses their writes even if the button is
-#  bypassed (a hidden button is not access control on its own, so this is
-#  checked server-side on both the open and the submit path).
+#  Three roles, resolved in src/ippms_config.py:
 #
-#  Entries are matched case-insensitively against the signed-in user's email,
-#  so the casing written here doesn't matter.
-GLOSSARY_EDITORS = {
-    "mohammed.shafique@vodafoneidea.com",
-    "devang.sheth@vodafoneidea.com",
-    "harish.saragadam@vodafoneidea.com",
-    "rahul.kulthe@vodafoneidea.com",
-    "amol.libe2@vodafoneidea.com",
-    "bhaskar.roy@vodafoneidea.com",
-    "apurva.singh2@vodafoneidea.com",
-    "vimal.atolia@vodafoneidea.com",
-    "vaibhav.patil@vodafoneidea.com",
-}
+#    admin  — everything an SME can do, plus the analytics dashboard and the
+#             power to approve SME applications. Listed in roles.yaml only,
+#             never grantable through the web UI.
+#    sme    — can add and edit glossary terms. Either seeded in roles.yaml, or
+#             approved at runtime by an admin.
+#    user   — the default. Sees "Apply for SME access" instead of the glossary
+#             form; otherwise uses the assistant exactly as before.
+#
+#  This replaces the hardcoded GLOSSARY_EDITORS set that used to live here. The
+#  nine people in that set kept their access: the six admins plus three seed
+#  SMEs in roles.yaml are the same nine addresses.
+#
+#  Roles are always re-checked server-side (see can_edit_glossary below, and
+#  every admin callback) — hiding a button is presentation, not access control.
 
 # Decode presets per graph role (mirrors gpu_llm_context.py).
 # SYNTHESIS is now temperature 0.0 (was 0.3): the query-spec engine makes the
@@ -543,7 +544,19 @@ CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_chat_interactions (
     tool_calls    JSONB,
     answer        TEXT,
     result_kind   TEXT,
-    latency_ms    INTEGER
+    latency_ms    INTEGER,
+    -- 'empty' (the query ran and matched nothing) or 'incomplete' (the question
+    -- was missing something the agent needed). Computed for the UI's helper
+    -- chips since long before this column existed, but not persisted — which
+    -- left two of the dashboard's painpoint views unanswerable. NULL is the
+    -- normal, healthy case.
+    notice        TEXT,
+    -- Which glossary this answer was produced under, and which of its terms
+    -- were actually injected. Wiring the glossary into answers means identical
+    -- questions can legitimately differ over time; these two columns are what
+    -- keep that explainable rather than spooky. NULL/0 = no glossary involved.
+    glossary_version BIGINT,
+    glossary_terms   JSONB
 );
 """
 _FEEDBACK_DDL = f"""
@@ -628,6 +641,15 @@ def _ensure_logging_tables() -> bool:
         try:
             with _log_cursor(commit=True) as cur:
                 cur.execute(_INTERACTIONS_DDL)
+                # Deployments created before the column existed. Adding a
+                # nullable column with no default does not rewrite the table,
+                # so this is cheap even on the million-row prod history.
+                cur.execute(f"ALTER TABLE {DB_SCHEMA}.vi_chat_interactions "
+                            f"ADD COLUMN IF NOT EXISTS notice TEXT")
+                cur.execute(f"ALTER TABLE {DB_SCHEMA}.vi_chat_interactions "
+                            f"ADD COLUMN IF NOT EXISTS glossary_version BIGINT")
+                cur.execute(f"ALTER TABLE {DB_SCHEMA}.vi_chat_interactions "
+                            f"ADD COLUMN IF NOT EXISTS glossary_terms JSONB")
                 cur.execute(_FEEDBACK_DDL)
             _logging_ready = True
             log.info("[STARTUP] chat interaction/feedback tables ready.")
@@ -679,8 +701,8 @@ def log_interaction(session_key: str, question: str, result: Dict[str, Any]) -> 
                 f"""INSERT INTO {DB_SCHEMA}.vi_chat_interactions
                     (session_key, question, route, confidence, entities, grounding,
                      query_spec, answered_via, fallback_used, tool_calls, answer,
-                     result_kind, latency_ms)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                     result_kind, latency_ms, notice, glossary_version, glossary_terms)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                 (session_key, question, result.get("route"), result.get("confidence"),
                  json.dumps(dbg.get("entities"), default=str),
                  json.dumps(dbg.get("grounding_summary"), default=str),
@@ -688,7 +710,10 @@ def log_interaction(session_key: str, question: str, result: Dict[str, Any]) -> 
                  result.get("answered_via"), bool(result.get("fallback_used")),
                  json.dumps(dbg.get("tool_calls"), default=str),
                  result.get("answer"), result.get("kind"),
-                 int((result.get("timing", {}) or {}).get("total", 0) * 1000)),
+                 int((result.get("timing", {}) or {}).get("total", 0) * 1000),
+                 result.get("notice"),
+                 result.get("glossary_version") or None,
+                 json.dumps(result.get("glossary_terms") or [], default=str)),
             )
             row = cur.fetchone()
             return int(row["id"]) if row else None
@@ -1055,14 +1080,17 @@ def _ensure_retention_sweeper() -> None:
 #  this one can't disable chat logging or history.
 
 def can_edit_glossary(email: Optional[str]) -> bool:
-    """Is this user allowed to add/edit glossary terms? (see GLOSSARY_EDITORS)
+    """Is this user allowed to add/edit glossary terms? (see config/roles.yaml)
 
-    The list is normalized here on every call rather than once at import, so
-    editing GLOSSARY_EDITORS is genuinely the only thing anyone has to change
-    — there's no second, pre-computed copy to keep in sync. The list is a
-    handful of entries, so the cost is irrelevant."""
-    e = (email or "").strip().lower()
-    return bool(e) and e in {x.strip().lower() for x in GLOSSARY_EDITORS}
+    True for admins and SMEs alike. Kept as a named helper so the call sites
+    read the same as before — the only change is that the roster now comes from
+    YAML plus approved applications instead of a set literal in this file."""
+    return ippms_config.can_edit_glossary(email)
+
+
+def is_admin(email: Optional[str]) -> bool:
+    """Is this user an admin? (approvals queue + analytics dashboard)"""
+    return ippms_config.is_admin(email)
 
 
 _GLOSSARY_DDL = f"""
@@ -1147,10 +1175,613 @@ def upsert_glossary_term(term: str, full_form: str, definition: str,
             # updated by this statement — the standard way to tell an upsert's
             # two outcomes apart, used here only to word the confirmation.
             was_update = not bool(row and row.get("inserted"))
+            # Terms now change answers, so a stale read cache would mean an SME
+            # saves a definition, immediately asks the question it applies to,
+            # and sees it ignored. Drop the cache here rather than make them
+            # wait out its TTL.
+            _invalidate_glossary_cache()
             return True, was_update, ""
     except Exception as exc:
         log.warning("upsert_glossary_term failed for %r: %s", term, exc)
         return False, False, f"Could not save the term: {exc}"
+
+
+# ── Glossary retrieval + injection ───────────────────────────────────────────
+#  The capture half of the glossary has existed since 4B-3; this is the half
+#  that makes a term actually change an answer.
+#
+#  ►► THE QUESTION TEXT IS NEVER REWRITTEN. ◄◄
+#
+#  The obvious design — substitute "GJW" with "Gujarat West" before parsing —
+#  is a trap. Device and interface names are built out of exactly these tokens:
+#  APVSPGJWPAR01HNE40 contains GJW, and "List devices matching PAR01" contains
+#  a term someone could plausibly add to the glossary. Rewriting the question
+#  would corrupt the very identifiers the executor matches on, and it would do
+#  it silently. So matched definitions are passed to the LLM ALONGSIDE the
+#  original question, never in place of any part of it.
+#
+#  Matching is word-boundary anchored for the same reason: \bGJW\b does not
+#  match inside APVSPGJWPAR01HNE40, so a glossary entry cannot start firing on
+#  substrings of hostnames.
+#
+#  Determinism: this is a real trade. Identical questions asked months apart
+#  can now differ, because the glossary changed in between. That is the point
+#  of the feature, but it has to stay explainable — so every interaction
+#  records the glossary version it was answered under and which terms were
+#  injected (see log_interaction). "Why did this answer change?" is then a
+#  query, not an investigation.
+
+_GLOSSARY_CACHE_TTL = 60.0
+_glossary_cache: Tuple[float, int, List[Dict[str, Any]]] = (0.0, 0, [])
+_glossary_cache_lock = threading.Lock()
+
+# How many definitions may ride along with one question. A bound, not a
+# preference: the local model has a finite context and the glossary is
+# unbounded, so a question that happens to contain twenty known terms must not
+# crowd out the retrieved data it is supposed to be summarising.
+GLOSSARY_MAX_INJECTED = 6
+GLOSSARY_MIN_ALIAS_LEN = 2
+
+
+def _invalidate_glossary_cache() -> None:
+    global _glossary_cache
+    with _glossary_cache_lock:
+        _glossary_cache = (0.0, 0, [])
+
+
+def _glossary_snapshot() -> Tuple[int, List[Dict[str, Any]]]:
+    """(version, rows), cached briefly.
+
+    The version is the epoch second of the most recent updated_at, so any
+    insert or edit moves it and an unchanged glossary keeps a stable number.
+    0 means an empty or unreachable glossary."""
+    global _glossary_cache
+    now = time.time()
+    with _glossary_cache_lock:
+        stamp, ver, rows = _glossary_cache
+        if stamp and (now - stamp) < _GLOSSARY_CACHE_TTL:
+            return ver, rows
+    if not _ensure_glossary_table():
+        return 0, []
+    try:
+        with _log_cursor() as cur:
+            cur.execute(
+                f"""SELECT term, full_form, definition, also_known_as,
+                           EXTRACT(EPOCH FROM updated_at)::bigint AS updated_epoch
+                      FROM {DB_SCHEMA}.vi_glossary_terms""")
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        log.warning("glossary load failed (answers continue without it): %s", exc)
+        return 0, []
+    ver = max((int(r.get("updated_epoch") or 0) for r in rows), default=0)
+    with _glossary_cache_lock:
+        _glossary_cache = (time.time(), ver, rows)
+    return ver, rows
+
+
+def _glossary_aliases(row: Dict[str, Any]) -> List[str]:
+    """Every string that should trigger this entry: the term itself plus each
+    comma-separated also_known_as."""
+    out = [str(row.get("term") or "").strip()]
+    for a in str(row.get("also_known_as") or "").split(","):
+        a = a.strip()
+        if a:
+            out.append(a)
+    return [a for a in out if len(a) >= GLOSSARY_MIN_ALIAS_LEN]
+
+
+def match_glossary_terms(text: str) -> List[Dict[str, Any]]:
+    """Glossary entries whose term or an alias appears in `text` as a whole
+    word. Longest alias first, so "HC In Octets" wins over "octets" when both
+    are defined and both would match."""
+    if not text:
+        return []
+    _, rows = _glossary_snapshot()
+    if not rows:
+        return []
+    candidates: List[Tuple[int, str, Dict[str, Any]]] = []
+    for row in rows:
+        for alias in _glossary_aliases(row):
+            candidates.append((len(alias), alias, row))
+    candidates.sort(key=lambda c: -c[0])
+
+    matched: List[Dict[str, Any]] = []
+    seen_terms: Set[str] = set()
+    claimed: List[Tuple[int, int]] = []   # character spans already explained
+    for _, alias, row in candidates:
+        key = str(row.get("term") or "").lower()
+        if key in seen_terms:
+            continue
+        # (?<!\w) / (?!\w) rather than \b so aliases that start or end with a
+        # non-word character still anchor correctly.
+        pattern = r"(?<!\w)" + re.escape(alias) + r"(?!\w)"
+        try:
+            hits = [m.span() for m in re.finditer(pattern, text, re.IGNORECASE)]
+        except re.error:
+            continue
+        # Keep the entry only if it explains some text no longer alias already
+        # covers. Without this, a question mentioning "HC In Octets" also drags
+        # in a generic "octets" entry, and the model is handed two competing
+        # definitions of the same words — longest-first ordering is what makes
+        # skipping the shorter one the right call rather than an arbitrary one.
+        fresh = [(a, b) for a, b in hits
+                 if not any(a >= ca and b <= cb for ca, cb in claimed)]
+        if not fresh:
+            continue
+        matched.append(row)
+        seen_terms.add(key)
+        claimed.extend(fresh)
+        if len(matched) >= GLOSSARY_MAX_INJECTED:
+            break
+    return matched
+
+
+def build_glossary_context(text: str) -> Tuple[str, List[str]]:
+    """(prompt block, matched term names) for a question.
+
+    Returns ("", []) when nothing matches, so callers can append
+    unconditionally without producing a dangling empty heading."""
+    matched = match_glossary_terms(text)
+    if not matched:
+        return "", []
+    lines = []
+    for r in matched:
+        term = str(r.get("term") or "").strip()
+        full = str(r.get("full_form") or "").strip()
+        definition = str(r.get("definition") or "").strip()
+        head = f"{term} ({full})" if full else term
+        lines.append(f"- {head}: {definition}")
+    block = ("VI-IPPMS glossary — definitions your colleagues recorded for terms in "
+             "this question. Treat them as authoritative over your own assumptions, "
+             "and use this wording in your answer:\n" + "\n".join(lines))
+    return block, [str(r.get("term") or "").strip() for r in matched]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4B-4 — SME ACCESS REQUESTS  (apply -> admin approves -> role granted)
+# ══════════════════════════════════════════════════════════════════════════════
+#  A normal user applies for SME access; an admin approves or rejects it. An
+#  approved row IS the grant — role_for() consults this table on top of
+#  config/roles.yaml.
+#
+#  Why Postgres and not roles.yaml: a grant is state, not configuration. It has
+#  an applicant, a justification, an approver and two timestamps, and it must
+#  survive a deploy. Writing it back into a config file would lose the audit
+#  trail, need the app to hold write permission on its own configuration, drift
+#  between the test and prod copies, and be silently reverted by the next
+#  release. Admins stay in YAML for the opposite reason — see config/roles.yaml.
+#
+#  Rows are never deleted. Revoking access flips status to 'revoked' rather than
+#  removing the row, so "who had access in March, and who granted it?" stays
+#  answerable.
+#
+#  Best-effort like every other table here: if the database is unreachable the
+#  apply/approve flow degrades to an error message, and role resolution falls
+#  back to roles.yaml alone. Admins and seed SMEs never depend on this table.
+
+_SME_REQUESTS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_sme_requests (
+    id            BIGSERIAL PRIMARY KEY,
+    email         TEXT NOT NULL,
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    justification TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','approved','rejected','revoked')),
+    decided_by    TEXT,
+    decided_at    TIMESTAMPTZ,
+    decision_note TEXT
+);
+"""
+# One open application per person, and one live grant per person. Partial
+# unique indexes rather than application-side checks: two rapid clicks on
+# Submit are two concurrent transactions, and only the database can settle
+# that race. Rejected and revoked rows are excluded from both, which is what
+# lets someone reapply after a rejection.
+_SME_REQUESTS_IDX_DDL = [
+    f"""CREATE UNIQUE INDEX IF NOT EXISTS ux_vi_sme_requests_pending
+        ON {DB_SCHEMA}.vi_sme_requests (lower(email)) WHERE status = 'pending';""",
+    f"""CREATE UNIQUE INDEX IF NOT EXISTS ux_vi_sme_requests_granted
+        ON {DB_SCHEMA}.vi_sme_requests (lower(email)) WHERE status = 'approved';""",
+    f"""CREATE INDEX IF NOT EXISTS ix_vi_sme_requests_status
+        ON {DB_SCHEMA}.vi_sme_requests (status, requested_at DESC);""",
+]
+
+_sme_ready = False
+_sme_ready_lock = threading.Lock()
+
+
+def _ensure_sme_tables() -> bool:
+    """Best-effort CREATE ... IF NOT EXISTS, independent of the other tables for
+    the same reason _ensure_user_feedback_table() is: a problem here must not
+    disable chat logging or history."""
+    global _sme_ready
+    if _sme_ready:
+        return True
+    with _sme_ready_lock:
+        if _sme_ready:
+            return True
+        if not DB_PASSWORD:
+            return False
+        try:
+            with _log_cursor(commit=True) as cur:
+                cur.execute(_SME_REQUESTS_DDL)
+                for ddl in _SME_REQUESTS_IDX_DDL:
+                    cur.execute(ddl)
+            _sme_ready = True
+            log.info("[STARTUP] SME request table ready.")
+            return True
+        except Exception as exc:
+            log.warning("Could not ensure vi_sme_requests (SME applications "
+                        "disabled; roles.yaml still applies): %s", exc)
+            return False
+
+
+# role_for() runs on every page render, so the grant lookup is cached rather
+# than hitting Postgres each time. The TTL is short and any approval decision
+# invalidates it immediately, so a newly approved SME sees their glossary
+# button on their next page load, not up to a minute later.
+_SME_GRANT_TTL = 30.0
+_sme_grant_cache: Tuple[float, Set[str]] = (0.0, set())
+_sme_grant_lock = threading.Lock()
+
+
+def _invalidate_sme_grants() -> None:
+    global _sme_grant_cache
+    with _sme_grant_lock:
+        _sme_grant_cache = (0.0, set())
+
+
+def approved_sme_emails() -> Set[str]:
+    """Emails with a live (status='approved') SME grant.
+
+    Registered with ippms_config as the grant provider. Once the table exists,
+    a database error propagates rather than being swallowed into an empty set:
+    empty is indistinguishable from "nobody is approved" and would silently
+    revoke every runtime grant. ippms_config catches it and falls back to
+    roles.yaml, so admins and seed SMEs are unaffected either way. The one case
+    that does return empty is a cold start with the database down, where no
+    grant is knowable at all."""
+    global _sme_grant_cache
+    now = time.time()
+    with _sme_grant_lock:
+        stamp, cached = _sme_grant_cache
+        if stamp and (now - stamp) < _SME_GRANT_TTL:
+            return cached
+    if not _ensure_sme_tables():
+        return set()
+    with _log_cursor() as cur:
+        cur.execute(f"SELECT lower(email) AS email FROM {DB_SCHEMA}.vi_sme_requests "
+                    f"WHERE status = 'approved'")
+        emails = {r["email"] for r in cur.fetchall()}
+    with _sme_grant_lock:
+        _sme_grant_cache = (time.time(), emails)
+    return emails
+
+
+def latest_sme_request(email: str) -> Optional[Dict[str, Any]]:
+    """The most recent application row for this person, whatever its status —
+    what the sidebar needs to decide between "Apply", "Pending" and showing a
+    rejection note. None if they have never applied (or the table is down)."""
+    e = (email or "").strip().lower()
+    if not e or not _ensure_sme_tables():
+        return None
+    try:
+        with _log_cursor() as cur:
+            cur.execute(
+                f"""SELECT id, email, requested_at, justification, status,
+                           decided_by, decided_at, decision_note
+                    FROM {DB_SCHEMA}.vi_sme_requests
+                    WHERE lower(email) = %s
+                    ORDER BY requested_at DESC LIMIT 1""", (e,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception as exc:
+        log.warning("latest_sme_request failed for %r: %s", e, exc)
+        return None
+
+
+def submit_sme_request(email: str, justification: str) -> Tuple[bool, str]:
+    """Record an application. Returns (ok, message-for-the-user).
+
+    Refused for people who already hold the access (admins and SMEs alike) —
+    not because it would break anything, but because an application from
+    someone who can already edit the glossary is pure noise in the queue."""
+    e = (email or "").strip().lower()
+    justification = (justification or "").strip()
+    if not e:
+        return False, "You need to be signed in to apply."
+    if ippms_config.can_edit_glossary(e):
+        return False, "You already have SME access."
+    if len(justification) < 20:
+        return False, ("Please say a little more about why you need SME access — "
+                       "an admin has to be able to act on it.")
+    if len(justification) > 2000:
+        return False, "That's longer than 2000 characters. Please shorten it."
+    if not _ensure_sme_tables():
+        return False, "The request database isn't reachable right now. Please try again later."
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""INSERT INTO {DB_SCHEMA}.vi_sme_requests (email, justification)
+                    VALUES (%s, %s) RETURNING id""", (e, justification))
+            cur.fetchone()
+        log.info("[SME] %s applied for SME access", e)
+        return True, ippms_config.content("sme_access", "submitted_toast")
+    except psycopg2.errors.UniqueViolation:
+        # The partial unique index on pending rows caught a double submit.
+        return False, "You already have an application waiting for review."
+    except Exception as exc:
+        log.warning("submit_sme_request failed for %r: %s", e, exc)
+        return False, f"Could not send the request: {exc}"
+
+
+def list_sme_requests(status: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    """Applications for the admin queue, newest first. status=None returns all."""
+    if not _ensure_sme_tables():
+        return []
+    try:
+        with _log_cursor() as cur:
+            if status:
+                cur.execute(
+                    f"""SELECT id, email, requested_at, justification, status,
+                               decided_by, decided_at, decision_note
+                        FROM {DB_SCHEMA}.vi_sme_requests WHERE status = %s
+                        ORDER BY requested_at DESC LIMIT %s""", (status, limit))
+            else:
+                cur.execute(
+                    f"""SELECT id, email, requested_at, justification, status,
+                               decided_by, decided_at, decision_note
+                        FROM {DB_SCHEMA}.vi_sme_requests
+                        ORDER BY requested_at DESC LIMIT %s""", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        log.warning("list_sme_requests failed: %s", exc)
+        return []
+
+
+def decide_sme_request(request_id: int, decision: str, admin_email: str,
+                       note: str = "") -> Tuple[bool, str]:
+    """Approve or reject a pending application, or revoke a live grant.
+
+    The caller must have already checked that admin_email is an admin; this is
+    re-asserted here anyway, because this is the function that actually changes
+    who can write to the glossary and it should not depend on every call site
+    remembering."""
+    decision = (decision or "").strip().lower()
+    if decision not in ("approved", "rejected", "revoked"):
+        return False, f"Unknown decision {decision!r}."
+    if not ippms_config.is_admin(admin_email):
+        log.warning("[SME] refused decision by non-admin %s on request %s",
+                    admin_email, request_id)
+        return False, "Only admins can decide SME applications."
+    if not _ensure_sme_tables():
+        return False, "The request database isn't reachable right now."
+    # Approving and rejecting act on a pending row; revoking acts on a live
+    # grant. Naming the expected current status in the WHERE clause makes each
+    # decision idempotent — a double-click updates one row, then zero.
+    expected = "approved" if decision == "revoked" else "pending"
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""UPDATE {DB_SCHEMA}.vi_sme_requests
+                    SET status = %s, decided_by = %s, decided_at = now(),
+                        decision_note = NULLIF(%s, '')
+                    WHERE id = %s AND status = %s
+                    RETURNING email""",
+                (decision, (admin_email or "").strip().lower(),
+                 (note or "").strip(), request_id, expected))
+            row = cur.fetchone()
+    except psycopg2.errors.UniqueViolation:
+        # Someone already holds a live grant for this address — two admins
+        # approving two applications from the same person at the same time.
+        return False, "That person already has an approved SME grant."
+    except Exception as exc:
+        log.warning("decide_sme_request failed for id=%s: %s", request_id, exc)
+        return False, f"Could not record the decision: {exc}"
+    if not row:
+        return False, ("That request is no longer %s — another admin may have "
+                       "already handled it." % expected)
+    _invalidate_sme_grants()
+    log.info("[SME] request %s for %s -> %s by %s",
+             request_id, row["email"], decision, admin_email)
+    return True, f"{row['email']} — {decision}."
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4B-5 — ANALYTICS  (read-only queries behind the admin dashboard)
+# ══════════════════════════════════════════════════════════════════════════════
+#  Every function here is a SELECT over tables the app already writes:
+#  vi_chat_interactions, vi_chat_feedback, user_feedback and ig_tool_call_audit.
+#  Nothing new is instrumented for the dashboard — if a number is not here, it
+#  is because it was never recorded, not because the query is missing.
+#
+#  All of them take a window in days and return plain lists of dicts, so the
+#  layout code does no SQL and the CSV export can reuse them directly.
+#
+#  Read-only and admin-gated at the callback layer. They are still written to
+#  fail soft: a dashboard panel that cannot load should show "unavailable",
+#  not take the chat app down.
+
+def _window_clause(days: Optional[int], column: str = "asked_at") -> str:
+    """SQL fragment for "within the last N days". days=None means all time.
+
+    Interpolated rather than parameterised because it is a column name and an
+    interval, neither of which can be bound — the only caller-supplied part is
+    an int that has already been through int()."""
+    if not days:
+        return "TRUE"
+    return f"{column} >= now() - INTERVAL '{int(days)} days'"
+
+
+def _analytics_rows(sql: str, params: Tuple = ()) -> List[Dict[str, Any]]:
+    """Run one analytics SELECT. Returns [] and logs on failure, so one broken
+    panel degrades to "no data" instead of an exception in a Dash callback."""
+    if not _ensure_logging_tables():
+        return []
+    try:
+        with _log_cursor() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        log.warning("analytics query failed: %s", exc)
+        return []
+
+
+def analytics_overview(days: Optional[int] = 30) -> Dict[str, Any]:
+    """The KPI row: volume, reach, quality and speed in one query.
+
+    p95 rather than mean latency — a mean hides the tail, and the tail is what
+    users actually complain about."""
+    w = _window_clause(days)
+    rows = _analytics_rows(f"""
+        SELECT count(*)                                            AS questions,
+               count(DISTINCT session_key)                         AS users,
+               count(*) FILTER (WHERE fallback_used)               AS fallbacks,
+               count(*) FILTER (WHERE result_kind = 'error')       AS errors,
+               count(*) FILTER (WHERE notice = 'empty')            AS empties,
+               count(*) FILTER (WHERE notice = 'incomplete')       AS incompletes,
+               percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms,
+               percentile_disc(0.50) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE {w}""")
+    out = dict(rows[0]) if rows else {}
+    votes = _analytics_rows(f"""
+        SELECT count(*) FILTER (WHERE f.vote = 'up')   AS ups,
+               count(*) FILTER (WHERE f.vote = 'down') AS downs
+          FROM {DB_SCHEMA}.vi_chat_feedback f
+          JOIN {DB_SCHEMA}.vi_chat_interactions i ON i.id = f.interaction_id
+         WHERE {_window_clause(days, 'i.asked_at')}""")
+    out.update(votes[0] if votes else {"ups": 0, "downs": 0})
+    return out
+
+
+def analytics_volume(days: Optional[int] = 30) -> List[Dict[str, Any]]:
+    """Questions per day. One series — the point is the trend, not a breakdown."""
+    return _analytics_rows(f"""
+        SELECT date_trunc('day', asked_at)::date AS day,
+               count(*)                          AS questions,
+               count(DISTINCT session_key)       AS users
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE {_window_clause(days)}
+         GROUP BY 1 ORDER BY 1""")
+
+
+def analytics_routes(days: Optional[int] = 30) -> List[Dict[str, Any]]:
+    """How questions were answered. answered_via is the honest field here:
+    'query_spec' is the deterministic path, 'react' is the fallback tool loop,
+    'help' and 'out_of_scope' never touched the data at all."""
+    return _analytics_rows(f"""
+        SELECT COALESCE(NULLIF(answered_via, ''), '(unrecorded)') AS answered_via,
+               count(*) AS questions
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE {_window_clause(days)}
+         GROUP BY 1 ORDER BY 2 DESC""")
+
+
+def analytics_top_questions(days: Optional[int] = 30, limit: int = 15) -> List[Dict[str, Any]]:
+    """Most-asked questions, matched case-insensitively on the exact text.
+
+    Deliberately not clustered or fuzzy-matched: an exact repeat is a fact, a
+    cluster is an opinion, and a dashboard that quietly merges two different
+    questions is worse than one that lists both."""
+    return _analytics_rows(f"""
+        SELECT min(question)             AS question,
+               count(*)                  AS asked,
+               count(DISTINCT session_key) AS users,
+               max(asked_at)             AS last_asked
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE {_window_clause(days)}
+         GROUP BY lower(btrim(question))
+         HAVING count(*) > 1
+         ORDER BY 2 DESC LIMIT %s""", (limit,))
+
+
+def analytics_top_users(days: Optional[int] = 30, limit: int = 15) -> List[Dict[str, Any]]:
+    """Who is actually using it. session_key is the signed-in email."""
+    return _analytics_rows(f"""
+        SELECT session_key                      AS email,
+               count(*)                         AS questions,
+               max(asked_at)                    AS last_seen,
+               percentile_disc(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE {_window_clause(days)}
+         GROUP BY 1 ORDER BY 2 DESC LIMIT %s""", (limit,))
+
+
+# ── Painpoints ───────────────────────────────────────────────────────────────
+#  Five views, each answering "what is going wrong", newest first. They are
+#  tables rather than charts on purpose: every one of them is mostly question
+#  text, and the useful action is reading the question, not comparing bars.
+
+def painpoint_downvotes(days: Optional[int] = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """Downvoted answers, with the free-text reason where the user gave one.
+
+    LEFT JOIN on user_feedback: the detail box is optional, and a downvote
+    without a comment is still the strongest signal on this dashboard."""
+    return _analytics_rows(f"""
+        SELECT i.id, i.asked_at, i.session_key, i.question, i.answered_via,
+               i.result_kind, uf.feedback_text
+          FROM {DB_SCHEMA}.vi_chat_feedback f
+          JOIN {DB_SCHEMA}.vi_chat_interactions i ON i.id = f.interaction_id
+          LEFT JOIN {DB_SCHEMA}.user_feedback uf ON uf.interaction_id = i.id
+         WHERE f.vote = 'down' AND {_window_clause(days, 'i.asked_at')}
+         ORDER BY i.asked_at DESC LIMIT %s""", (limit,))
+
+
+def painpoint_fallbacks(days: Optional[int] = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """Questions that fell back to the ReAct tool loop — the deterministic
+    QuerySpec path could not plan them. These are the best candidates for a new
+    query shape, because the agent already told you it was improvising."""
+    return _analytics_rows(f"""
+        SELECT id, asked_at, session_key, question, answered_via, latency_ms
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE fallback_used AND {_window_clause(days)}
+         ORDER BY asked_at DESC LIMIT %s""", (limit,))
+
+
+def painpoint_empty(days: Optional[int] = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """Questions that ran fine and returned nothing, plus ones the agent judged
+    incomplete. Usually a vocabulary gap — which is exactly what the glossary
+    is for."""
+    return _analytics_rows(f"""
+        SELECT id, asked_at, session_key, question, notice, answered_via
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE notice IN ('empty','incomplete') AND {_window_clause(days)}
+         ORDER BY asked_at DESC LIMIT %s""", (limit,))
+
+
+def painpoint_slow(days: Optional[int] = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """Slowest questions, worst first."""
+    return _analytics_rows(f"""
+        SELECT id, asked_at, session_key, question, answered_via, latency_ms
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE latency_ms IS NOT NULL AND {_window_clause(days)}
+         ORDER BY latency_ms DESC LIMIT %s""", (limit,))
+
+
+def painpoint_errors(days: Optional[int] = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """Answers that failed outright."""
+    return _analytics_rows(f"""
+        SELECT id, asked_at, session_key, question, answered_via, answer
+          FROM {DB_SCHEMA}.vi_chat_interactions
+         WHERE result_kind = 'error' AND {_window_clause(days)}
+         ORDER BY asked_at DESC LIMIT %s""", (limit,))
+
+
+def painpoint_tool_failures(days: Optional[int] = 30, limit: int = 50) -> List[Dict[str, Any]]:
+    """Failing MCP tool calls, grouped by tool and message.
+
+    From ig_tool_call_audit, which the MCP server writes — so this is the one
+    panel that sees the gateway rather than the chat app. A tool failing here
+    while the chat looks healthy usually means Instant Graph, not this code."""
+    return _analytics_rows(f"""
+        SELECT tool_name,
+               COALESCE(NULLIF(error_message, ''), '(no message)') AS error_message,
+               count(*)      AS failures,
+               max(called_at) AS last_failed
+          FROM {DB_SCHEMA}.ig_tool_call_audit
+         WHERE NOT success AND {_window_clause(days, 'called_at')}
+         GROUP BY 1, 2 ORDER BY 3 DESC LIMIT %s""", (limit,))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1517,6 +2148,13 @@ class VIAgentState(TypedDict):
     fallback_used: bool
     tool_calls:   int
     debug:        Dict[str, Any] # full per-run debug object (§3.2)
+    # Glossary definitions matched against this question, resolved once in
+    # run_agent and reused by every node that prompts the LLM — matching twice
+    # could otherwise give the router and the synthesiser different definitions
+    # if an SME saved a term mid-run.
+    glossary_block:   str
+    glossary_terms:   List[str]
+    glossary_version: int
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1994,6 +2632,11 @@ def router_node(state: VIAgentState) -> VIAgentState:
     user_prompt = f"Question: {q}"
     if rag:
         user_prompt += f"\n\n{rag}\n\n(Use the examples only as hints for route/target/metric.)"
+    # Appended, never substituted into the question — see the glossary
+    # injection notes in SECTION 4B-3. The question the router reads is the
+    # question the user typed.
+    if state.get("glossary_block"):
+        user_prompt += f"\n\n{state['glossary_block']}"
     raw = call_llm(ROUTER_SYSTEM, user_prompt, max_new_tokens=200,
                    decode=ROUTER_DECODE, stage="ROUTER")
     parsed = safe_json(raw)
@@ -4115,7 +4758,7 @@ def spec_node(state: VIAgentState) -> VIAgentState:
 
 
 # ── Scope handling (§3.3): unrelated vs monitoring-shaped-but-unsupported ─────
-# Distinct, specific messages — neither is the generic HELP_TEXT.
+# Distinct, specific messages — neither is the generic help_text().
 
 _UNSUPPORTED_PATTERNS = [
     (r"\b(restart|reboot|bounce|shut\s?down|shutdown|disable|enable|turn (on|off))\b",
@@ -4283,6 +4926,10 @@ def synthesize_node(state: VIAgentState) -> VIAgentState:
 
     user_p = (f"Question: {state['user_query']}\n\n"
               f"Retrieved data:\n{json.dumps(evidence, indent=2, default=str)[:2500]}")
+    # After the data, so a long glossary can never push the retrieved rows out
+    # of the model's attention — the data is what the answer must be built on.
+    if state.get("glossary_block"):
+        user_p += f"\n\n{state['glossary_block']}"
     ans = call_llm(SYNTH_SYSTEM, user_p, max_new_tokens=300,
                    decode=SYNTHESIS_DECODE, stage="SYNTH").strip()
     if not ans and state.get("answer"):
@@ -4297,21 +4944,19 @@ def synthesize_node(state: VIAgentState) -> VIAgentState:
     return {**state, "answer": _alt_note(state, ans)}
 
 
-HELP_TEXT = (
-    "I'm the Talk-to-VI-IPPMS assistant. I answer questions about your network "
-    "monitoring data using live APIs — no SQL. Try:\n"
-    "• Metadata: “How many devices are in the GUJ circle?”, “How many interfaces "
-    "on APVSPGJWPAR01HNE40?”, “List devices matching PAR01”, “How many KPIs are "
-    "tracked on that device?”\n"
-    "• KPI data: “On <device>, interface 100GE0/3/2, what was HC In Octets in the "
-    "last 6 hours?”, “min/max/avg traffic on Eth-Trunk1 yesterday”."
-)
+def help_text() -> str:
+    """The "what can you do?" reply. Editable in config/content.yaml.
+
+    Read through the accessor on every call rather than captured into a module
+    constant at import, so "Reload config" on the admin dashboard takes effect
+    without restarting the service."""
+    return ippms_config.content("help_text")
 
 
 def help_node(state: VIAgentState) -> VIAgentState:
     dbg = _dbg(state)
     dbg["answered_via"] = "help"
-    return {**state, "result_kind": "text", "answer": HELP_TEXT,
+    return {**state, "result_kind": "text", "answer": help_text(),
             "answered_via": "help", "debug": dbg}
 
 
@@ -4379,7 +5024,19 @@ def run_agent(user_query: str, session_key: str) -> VIAgentState:
         "plan": "", "trace": [], "result_kind": "text", "payload": {},
         "answer": "", "answered_via": "", "failed": False, "fallback_used": False,
         "tool_calls": 0, "debug": {},
+        "glossary_block": "", "glossary_terms": [], "glossary_version": 0,
     }
+    # Best-effort: a glossary lookup must never be the reason a question fails.
+    try:
+        block, terms = build_glossary_context(user_query)
+        version, _ = _glossary_snapshot()
+        initial["glossary_block"] = block
+        initial["glossary_terms"] = terms
+        initial["glossary_version"] = version
+        if terms:
+            log.info("[GLOSSARY] injected %s for %r", terms, user_query[:60])
+    except Exception as exc:
+        log.warning("glossary context failed (answering without it): %s", exc)
     try:
         return vi_graph.invoke(initial)
     except Exception as exc:
@@ -4620,7 +5277,7 @@ def build_params_view(state: VIAgentState) -> List[Dict[str, str]]:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Two distinct situations get a "notice" + a row of clickable follow-up chips
 #  in the reply, reusing the SAME {"type": "quickq", ...} pattern-matched
-#  button id the welcome-screen QUICK_QS chips already use — clicking one just
+#  button id the welcome-screen starter chips already use — clicking one just
 #  sends that text as the next question, no new callback needed:
 #
 #   1. "incomplete" — the pipeline itself asked for more information: a
@@ -4792,7 +5449,7 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
     # (not None/"") for every normal, successfully-recognized question — that
     # string is truthy in Python, so `if scope_verdict:` below fired on
     # literally every answer, not just unrelated/unsupported ones, showing
-    # the QUICK_QS example chips on every single message. Only "unrelated"
+    # the starter example chips on every single message. Only "unrelated"
     # and "unsupported" (the two values scope_check() actually returns) mean
     # the question was out of scope.
     scope_verdict = dbg.get("scope_verdict")
@@ -4810,7 +5467,7 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
     notice: Optional[str] = None
     suggestions: List[Dict[str, str]] = []
     if out_of_scope:
-        suggestions = [{"label": (eq[:30] + "…") if len(eq) > 30 else eq, "q": eq} for eq in QUICK_QS]
+        suggestions = [{"label": (eq[:30] + "…") if len(eq) > 30 else eq, "q": eq} for eq in quick_questions()]
     elif answered_via == "help":
         pass
     elif kind == "text" and (answered_via == "query_spec" or state.get("failed")):
@@ -4832,6 +5489,8 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
         "rows": rows, "cols": cols, "fig": fig_json, "stats": stats,
         "ts_rows": ts_rows, "ts_cols": ts_cols,
         "notice": notice, "suggestions": suggestions,
+        "glossary_version": state.get("glossary_version") or 0,
+        "glossary_terms": state.get("glossary_terms") or [],
         "plan": state.get("plan", ""),
         "trace": trace_view,
         "params": params_view,
@@ -4863,12 +5522,12 @@ ROUTE_LABEL = {"metadata_q": "METADATA", "kpi_q": "KPI DATA",
 ROUTE_COLOR = {"metadata_q": "#22d3ee", "kpi_q": "#34d399",
                "help_q": "#a78bfa", "out_of_scope": "#f87171"}
 
-QUICK_QS = [
-    "How many devices are in the GUJ circle?",
-    "List devices matching PAR01",
-    "How many components on APVSPGJWPAR01HNE40?",
-    "How many KPIs are tracked on APVSPGJWPAR01HNE40?",
-]
+def quick_questions() -> List[str]:
+    """Starter chips on the welcome screen, and the fallback suggestions shown
+    after an unrelated question. Editable in config/content.yaml; read per call
+    so a config reload applies without a restart."""
+    return list(ippms_config.content("quick_questions") or [])
+
 
 app.index_string = """
 <!DOCTYPE html>
@@ -5060,6 +5719,75 @@ app.index_string = """
         padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.55);}
     .fbm-title{font-size:15px;font-weight:700;margin-bottom:4px;}
     .fbm-sub{font-size:12px;color:var(--muted);margin:0 0 14px;}
+    .fbm-lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+        color:var(--muted);margin:4px 0 6px;}
+    /* admin panel */
+    .adm-backdrop{position:fixed;inset:0;background:rgba(5,8,14,.72);z-index:1200;
+        display:flex;align-items:flex-start;justify-content:center;overflow-y:auto;padding:4vh 16px;}
+    .adm-card{width:min(940px,100%);background:var(--panel);border:1px solid var(--line);
+        border-radius:12px;padding:20px 22px 26px;box-shadow:0 24px 70px rgba(0,0,0,.6);}
+    .adm-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;}
+    .adm-title{font-size:17px;font-weight:700;display:flex;align-items:center;}
+    .adm-notice{margin:10px 0 0;padding:9px 12px;border-radius:7px;font-size:12.5px;
+        background:rgba(34,211,238,.1);border:1px solid rgba(34,211,238,.3);color:var(--cyan);}
+    .adm-sec{margin-top:22px;}
+    .adm-sec-h{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);
+        margin-bottom:9px;font-weight:600;}
+    .adm-list{display:flex;flex-direction:column;gap:9px;}
+    .adm-row{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:11px 13px;}
+    .adm-row-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;}
+    .adm-email{font-size:13px;font-weight:600;}
+    .adm-when{font-size:11px;color:var(--muted);white-space:nowrap;}
+    .adm-just{font-size:12.5px;color:var(--text);margin:7px 0 10px;line-height:1.5;
+        white-space:pre-wrap;word-break:break-word;}
+    .adm-row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+    .adm-note{flex:1 1 220px;min-width:180px;padding:7px 10px;background:var(--panel);
+        border:1px solid var(--line);border-radius:6px;color:var(--text);font-size:12px;}
+    .adm-note:focus{outline:none;border-color:var(--cyan);}
+    .adm-btn-ok{padding:7px 15px;border-radius:6px;border:1px solid rgba(52,211,153,.45);
+        background:rgba(52,211,153,.14);color:var(--green);font-size:12px;font-weight:600;cursor:pointer;}
+    .adm-btn-no{padding:7px 15px;border-radius:6px;border:1px solid rgba(248,113,113,.45);
+        background:rgba(248,113,113,.12);color:var(--red);font-size:12px;font-weight:600;cursor:pointer;}
+    .adm-empty{font-size:12.5px;color:var(--muted);padding:10px 2px;}
+    .adm-yaml{font-size:12.5px;line-height:1.7;word-break:break-word;}
+    .adm-hint{font-size:11.5px;color:var(--muted);margin:9px 0 11px;line-height:1.55;}
+    /* dashboard: tabs, range chips, stat tiles, tables */
+    .adm-tabs{display:flex;gap:6px;margin:14px 0 4px;border-bottom:1px solid var(--line);}
+    .adm-tab{background:transparent;border:none;border-bottom:2px solid transparent;
+        color:var(--muted);padding:8px 13px;font-size:12.5px;font-weight:600;cursor:pointer;}
+    .adm-tab:hover{color:var(--text);}
+    .adm-tab-on{color:var(--cyan);border-bottom-color:var(--cyan);}
+    .adm-range{display:flex;gap:6px;margin:15px 0 2px;}
+    .adm-chip{background:transparent;border:1px solid var(--line);border-radius:999px;
+        color:var(--muted);padding:4px 13px;font-size:11.5px;cursor:pointer;}
+    .adm-chip:hover{border-color:var(--cyan);color:var(--cyan);}
+    .adm-chip-on{border-color:var(--cyan);color:var(--cyan);background:rgba(34,211,238,.09);}
+    .adm-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));
+        gap:10px;margin-top:18px;}
+    .adm-stat{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:13px 14px;}
+    .adm-stat-v{font-size:25px;font-weight:700;line-height:1.15;letter-spacing:-.02em;}
+    .adm-stat-l{font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+        color:var(--muted);margin-top:5px;font-weight:600;}
+    .adm-stat-s{font-size:11px;color:var(--muted);margin-top:3px;opacity:.8;}
+    .adm-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:2px;}
+    .adm-table th{text-align:left;font-size:10.5px;text-transform:uppercase;
+        letter-spacing:.07em;color:var(--muted);font-weight:600;padding:7px 9px;
+        border-bottom:1px solid var(--line);white-space:nowrap;}
+    .adm-table td{padding:8px 9px;border-bottom:1px solid rgba(30,41,59,.55);
+        vertical-align:top;line-height:1.45;}
+    .adm-table tr:last-child td{border-bottom:none;}
+    .adm-table tr:hover td{background:rgba(34,211,238,.045);}
+    .adm-td-question,.adm-td-feedback_text,.adm-td-error_message,.adm-td-answer{
+        min-width:190px;word-break:break-word;}
+    .adm-td-session_key,.adm-td-email{color:var(--muted);font-family:'JetBrains Mono',monospace;
+        font-size:11px;white-space:nowrap;}
+    .adm-td-asked_at,.adm-td-last_asked,.adm-td-last_seen,.adm-td-last_failed,
+    .adm-td-latency_ms,.adm-td-asked,.adm-td-users,.adm-td-questions,.adm-td-failures,
+    .adm-td-p50_ms{white-space:nowrap;color:var(--muted);}
+    .adm-csv{margin:0;}
+    .adm-tfoot{display:flex;align-items:center;justify-content:space-between;
+        gap:12px;margin-top:10px;}
+    .adm-count{font-size:11px;color:var(--muted);}
     .fbm-textarea{width:100%;min-height:90px;background:var(--panel2);border:1px solid var(--line);
         border-radius:8px;color:var(--text);font-size:13px;font-family:'Inter',sans-serif;padding:10px 12px;
         resize:vertical;}
@@ -5206,23 +5934,21 @@ def av():
 
 
 def welcome():
+    """The empty-conversation screen. All of its copy — eyebrow, heading, intro,
+    the four capability cards and the starter chips — comes from
+    config/content.yaml, read per render so "Reload config" applies live.
+
+    A capability card carries its question in its own id, exactly like a starter
+    chip, so clicking one asks that question through the same callback."""
     caps = [
-        ("🗂️", "Device metadata", "Counts & listings of devices by circle or name pattern",
-         "How many devices are in the GUJ circle?"),
-        ("🔌", "Interfaces & components", "Interfaces / components / KPIs per device",
-         "How many interfaces on APVSPGJWPAR01HNE40?"),
-        ("📈", "KPI retrieval", "Values & statistics over a time window",
-         "min/max/avg HC In Octets on Interface 100GE0/3/2 in the last 6 hours"),
-        ("🧭", "Filter & slice", "Slice devices/KPIs by circle, component, threshold",
-         "List devices matching PAR01"),
+        (c.get("icon", ""), c.get("title", ""), c.get("description", ""), c.get("question", ""))
+        for c in (ippms_config.content("capabilities") or [])
+        if isinstance(c, dict) and c.get("question")
     ]
     return html.Div(className="welcome", children=[
-        html.Div("TALK TO VI-IPPMS", className="w-eye"),
-        html.Div("What would you like to know?", className="w-h"),
-        html.P("Ask in plain English. The agent routes through Router → Resolve → "
-               "QuerySpec → deterministic executor → Synthesize (falling back to a "
-               "ReAct tool loop only for unusual shapes), using live Instant Graph APIs.",
-               className="w-p"),
+        html.Div(ippms_config.content("welcome", "eyebrow"), className="w-eye"),
+        html.Div(ippms_config.content("welcome", "heading"), className="w-h"),
+        html.P(ippms_config.content("welcome", "intro"), className="w-p"),
         html.Div(className="cap-grid", children=[
             html.Div(className="cap", id={"type": "quickq", "src": "cap", "q": q}, n_clicks=0,
                      children=[
@@ -5231,7 +5957,7 @@ def welcome():
         ]),
         html.Div(className="chips", children=[
             html.Button(q, className="chip", id={"type": "quickq", "src": "chip", "q": q}, n_clicks=0)
-            for q in QUICK_QS
+            for q in quick_questions()
         ]),
     ])
 
@@ -5396,7 +6122,7 @@ def _debug_panel(debug: Dict[str, Any]):
 def _suggestions_panel(notice: Optional[str], suggestions: List[Dict[str, str]], index: int):
     """Notice + a row of clickable follow-up chips for an incomplete/ambiguous
     question or an empty result (§ user request). Chips reuse the exact
-    {"type": "quickq", ...} id pattern the welcome-screen QUICK_QS buttons
+    {"type": "quickq", ...} id pattern the welcome-screen starter buttons
     already use, so on_send already handles a click with no new callback."""
     if not suggestions:
         return None
@@ -5592,6 +6318,431 @@ def glossary_modal():
     ])
 
 
+def sme_apply_modal(last_request=None):
+    """The "Apply for SME access" form, shown to users who cannot edit the
+    glossary. All of its copy comes from config/content.yaml.
+
+    If their previous application was rejected, the admin's note is shown above
+    the form rather than hidden — being told "no" without a reason is how people
+    end up reapplying with the same justification."""
+    rejected = (last_request or {}).get("status") == "rejected"
+    note = (last_request or {}).get("decision_note") or ""
+    header: List[Any] = [
+        html.Div(ippms_config.content("sme_access", "modal_title"), className="fbm-title"),
+        html.P(ippms_config.content("sme_access", "modal_blurb"), className="fbm-sub"),
+    ]
+    if rejected:
+        header.append(html.Div(className="fbm-err", children=[
+            html.B("Your previous request was not approved. "),
+            html.Span(note or "No reason was given."),
+        ]))
+    return html.Div(className="fbm-backdrop", children=[
+        html.Div(className="fbm-card", children=header + [
+            html.Div(ippms_config.content("sme_access", "justification_label"), className="fbm-lbl"),
+            dcc.Textarea(id="sme-justification", className="fbm-textarea",
+                         placeholder=ippms_config.content("sme_access", "justification_placeholder")),
+            html.Div(id="sme-error"),
+            html.Div(className="fbm-actions", children=[
+                html.Button("Cancel", id="sme-cancel", n_clicks=0, className="fbm-btn-ghost"),
+                html.Button("Send request", id="sme-submit", n_clicks=0, className="fbm-btn-primary"),
+            ]),
+        ]),
+    ])
+
+
+# ── Admin panel ──────────────────────────────────────────────────────────────
+#  A full-screen overlay rather than a third top-level view, so route_page's
+#  outputs and the "every Input must exist in the initial layout" constraint
+#  are left alone. Rendered only for admins, and every callback behind it
+#  re-checks that server-side.
+
+def _fmt_ts(ts: Any) -> str:
+    try:
+        return ts.strftime("%d %b %Y %H:%M")
+    except Exception:
+        return str(ts or "")
+
+
+def _sme_request_row(r: Dict[str, Any]) -> Any:
+    """One pending application: who, when, why, and the two decisions.
+
+    The note box is per row, not one shared box for the panel — an admin
+    rejecting two requests for different reasons should not have to think
+    about which box applies to which."""
+    rid = r["id"]
+    return html.Div(className="adm-row", children=[
+        html.Div(className="adm-row-head", children=[
+            html.Span(r["email"], className="mono adm-email"),
+            html.Span(_fmt_ts(r["requested_at"]), className="adm-when"),
+        ]),
+        html.Div(r["justification"], className="adm-just"),
+        html.Div(className="adm-row-actions", children=[
+            dcc.Input(id={"type": "sme-note", "id": rid}, type="text", className="adm-note",
+                      placeholder="Optional note — shown to them if you reject"),
+            html.Button("Approve", n_clicks=0, className="adm-btn-ok",
+                        id={"type": "sme-decide", "id": rid, "action": "approved"}),
+            html.Button("Reject", n_clicks=0, className="adm-btn-no",
+                        id={"type": "sme-decide", "id": rid, "action": "rejected"}),
+        ]),
+    ])
+
+
+def _sme_grant_row(r: Dict[str, Any]) -> Any:
+    """One live grant, with the audit trail that justified it."""
+    rid = r["id"]
+    by = r.get("decided_by") or "—"
+    return html.Div(className="adm-row", children=[
+        html.Div(className="adm-row-head", children=[
+            html.Span(r["email"], className="mono adm-email"),
+            html.Span(f"approved by {by} · {_fmt_ts(r.get('decided_at'))}", className="adm-when"),
+        ]),
+        html.Div(className="adm-row-actions", children=[
+            dcc.Input(id={"type": "sme-note", "id": rid}, type="text", className="adm-note",
+                      placeholder="Optional reason for revoking"),
+            html.Button("Revoke", n_clicks=0, className="adm-btn-no",
+                        id={"type": "sme-decide", "id": rid, "action": "revoked"}),
+        ]),
+    ])
+
+
+# ── Dashboard pieces ─────────────────────────────────────────────────────────
+#  Chart choices, briefly, because they were deliberate:
+#
+#  - The headline numbers are stat tiles, not a bar chart. Eight bars where the
+#    story is "183 questions, 4 people, 6% downvoted" is the classic way a chart
+#    misses its own point.
+#  - Volume over time is ONE line. A second series on a second axis would let
+#    the reader infer a correlation the data does not contain.
+#  - answered_via is a horizontal bar in ONE hue. Colouring each bar by its own
+#    size would double-encode length as colour and spend the only free channel
+#    on information the bar already shows.
+#  - The painpoints are tables. They are mostly question text, and the useful
+#    action is reading the question, not comparing bars.
+#
+#  So no categorical palette is needed anywhere here, which is just as well:
+#  the app's existing PAL fails CVD separation on this surface.
+
+ADM_INK = "#22d3ee"      # single accent, same cyan as the rest of the UI
+ADM_GRID = "rgba(148,163,184,.13)"
+ADM_SURFACE = "#0f1626"
+
+
+def _adm_layout(fig: go.Figure, height: int) -> go.Figure:
+    """Shared chart chrome: recessive grid, no dashes, generous padding."""
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor=ADM_SURFACE, plot_bgcolor=ADM_SURFACE,
+        height=height, margin=dict(l=10, r=18, t=10, b=30), showlegend=False,
+        font=dict(family="Inter, sans-serif", size=11, color="#7c8aa5"),
+        hoverlabel=dict(bgcolor="#131c30", bordercolor="#1e293b",
+                        font=dict(color="#e2e8f0", size=12)),
+    )
+    fig.update_xaxes(gridcolor=ADM_GRID, zeroline=False, linecolor=ADM_GRID)
+    fig.update_yaxes(gridcolor=ADM_GRID, zeroline=False, linecolor=ADM_GRID)
+    return fig
+
+
+def build_admin_volume_fig(rows: List[Dict[str, Any]]) -> Optional[go.Figure]:
+    """Questions per day. One series, so no legend — the heading names it."""
+    if not rows:
+        return None
+    xs = [r["day"] for r in rows]
+    ys = [r["questions"] for r in rows]
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, mode="lines", line=dict(color=ADM_INK, width=2, shape="linear"),
+        fill="tozeroy", fillcolor="rgba(34,211,238,.10)",
+        hovertemplate="%{x|%d %b}<br>%{y} questions<extra></extra>"))
+    fig.update_layout(hovermode="x unified")
+    return _adm_layout(fig, 200)
+
+
+def build_admin_routes_fig(rows: List[Dict[str, Any]]) -> Optional[go.Figure]:
+    """How questions were answered. One hue for every bar — length is the
+    encoding, colour is not a second copy of it. Direct value labels, since
+    there are only a handful of categories."""
+    if not rows:
+        return None
+    rows = list(reversed(rows))          # largest at the top in a horizontal bar
+    fig = go.Figure(go.Bar(
+        x=[r["questions"] for r in rows], y=[r["answered_via"] for r in rows],
+        orientation="h", marker=dict(color=ADM_INK, line=dict(width=0)),
+        text=[f"{r['questions']}" for r in rows], textposition="outside",
+        textfont=dict(color="#7c8aa5", size=11),
+        hovertemplate="%{y}: %{x} questions<extra></extra>"))
+    fig.update_xaxes(showgrid=False, showticklabels=False)
+    fig.update_yaxes(showgrid=False)
+    # Thin bars: a 600px-long saturated block reads loud, and length is
+    # already carrying the whole message. cornerradius is deliberately not
+    # used — it needs a newer plotly than this deployment pins.
+    fig = _adm_layout(fig, max(110, 30 * len(rows) + 34))
+    fig.update_layout(margin=dict(l=10, r=54, t=6, b=6), bargap=0.62)
+    return fig
+
+
+def _stat(label: str, value: Any, sub: str = "") -> Any:
+    return html.Div(className="adm-stat", children=[
+        html.Div(str(value), className="adm-stat-v"),
+        html.Div(label, className="adm-stat-l"),
+        html.Div(sub, className="adm-stat-s") if sub else None,
+    ])
+
+
+def _pct(part: Any, whole: Any) -> str:
+    try:
+        return f"{(100.0 * float(part) / float(whole)):.1f}%" if whole else "—"
+    except Exception:
+        return "—"
+
+
+def _ms(v: Any) -> str:
+    try:
+        return f"{float(v)/1000:.1f}s"
+    except Exception:
+        return "—"
+
+
+def _adm_table(rows: List[Dict[str, Any]], cols: List[Tuple[str, str]],
+               csv_key: str, empty: str, show: int = 12, fetched: int = 0) -> Any:
+    """A compact table plus its own CSV button.
+
+    cols is [(key, heading)]. Long text is truncated for the cell but kept in
+    the title attribute, so the full question is one hover away rather than
+    lost.
+
+    Only `show` rows are rendered. Six painpoint sections at sixty rows each
+    made the tab ten thousand pixels tall, which is not a dashboard — it is a
+    log file. The CSV button exports the whole window, so nothing is hidden,
+    just not all on screen at once. `fetched` is the query's limit, used only
+    to say "60+" honestly when the result was itself truncated."""
+    if not rows:
+        return html.Div(empty, className="adm-empty")
+    total = len(rows)
+    visible = rows[:show]
+    head = html.Tr([html.Th(h) for _, h in cols])
+    body = []
+    for r in visible:
+        tds = []
+        for key, _ in cols:
+            v = r.get(key)
+            if key.endswith("_at") or key in ("last_asked", "last_seen", "last_failed"):
+                txt = _fmt_ts(v)
+            elif key.endswith("_ms"):
+                txt = _ms(v)
+            else:
+                txt = "" if v is None else str(v)
+            tds.append(html.Td(txt if len(txt) <= 90 else txt[:88] + "…",
+                               title=txt, className=f"adm-td-{key}"))
+        body.append(html.Tr(tds))
+    more = total - len(visible)
+    caption = (f"Showing {len(visible)} of {total}{'+' if fetched and total >= fetched else ''}"
+               if more > 0 else f"{total} row{'s' if total != 1 else ''}")
+    return html.Div([
+        html.Table(className="adm-table", children=[html.Thead(head), html.Tbody(body)]),
+        html.Div(className="adm-tfoot", children=[
+            html.Span(caption, className="adm-count"),
+            html.Button("⬇  CSV", n_clicks=0, className="csvb adm-csv",
+                        id={"type": "adm-csv", "what": csv_key}),
+        ]),
+    ])
+
+
+def _admin_tabs(active: str) -> Any:
+    tabs = [("requests", "SME requests"), ("usage", "Usage"), ("painpoints", "Painpoints")]
+    return html.Div(className="adm-tabs", children=[
+        html.Button(label, n_clicks=0, id={"type": "adm-tab", "tab": key},
+                    className="adm-tab adm-tab-on" if key == active else "adm-tab")
+        for key, label in tabs
+    ])
+
+
+def _admin_range(active: Optional[int]) -> Any:
+    opts = [(7, "7 days"), (30, "30 days"), (90, "90 days"), (0, "All time")]
+    return html.Div(className="adm-range", children=[
+        html.Button(label, n_clicks=0, id={"type": "adm-days", "days": d},
+                    className="adm-chip adm-chip-on" if d == (active or 0) else "adm-chip")
+        for d, label in opts
+    ])
+
+
+# ── Tab bodies ───────────────────────────────────────────────────────────────
+
+def _admin_requests_tab() -> List[Any]:
+    pending = list_sme_requests("pending")
+    granted = list_sme_requests("approved")
+    admins = ippms_config.admin_emails()
+    seeds = ippms_config.seed_sme_emails()
+    return [
+        html.Div(className="adm-sec", children=[
+            html.Div(f"Pending SME applications ({len(pending)})", className="adm-sec-h"),
+            html.Div(className="adm-list", children=(
+                [_sme_request_row(r) for r in pending] if pending
+                else [html.Div("Nothing waiting for review.", className="adm-empty")])),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div(f"SME access granted here ({len(granted)})", className="adm-sec-h"),
+            html.Div(className="adm-list", children=(
+                [_sme_grant_row(r) for r in granted] if granted
+                else [html.Div("No runtime grants yet — only the seeded SMEs below.",
+                               className="adm-empty")])),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("From config/roles.yaml", className="adm-sec-h"),
+            html.Div(className="adm-yaml", children=[
+                html.Div([html.B("Admins: "), ", ".join(admins) or "none"]),
+                html.Div([html.B("Seed SMEs: "), ", ".join(seeds) or "none"]),
+                html.P("These are set in the file on the server and cannot be changed "
+                       "from here — that is deliberate. Edit config/roles.yaml and press "
+                       "Reload config.", className="adm-hint"),
+                html.Button("Reload config", id="admin-reload-btn", n_clicks=0,
+                            className="fbm-btn-ghost"),
+            ]),
+        ]),
+    ]
+
+
+def _admin_usage_tab(days: Optional[int]) -> List[Any]:
+    o = analytics_overview(days)
+    volume = analytics_volume(days)
+    routes = analytics_routes(days)
+    q = o.get("questions") or 0
+    votes = (o.get("ups") or 0) + (o.get("downs") or 0)
+    vfig = build_admin_volume_fig(volume)
+    rfig = build_admin_routes_fig(routes)
+    return [
+        html.Div(className="adm-stats", children=[
+            _stat("Questions", f"{q:,}"),
+            _stat("People", o.get("users") or 0),
+            _stat("Downvoted", _pct(o.get("downs"), votes),
+                  f"{o.get('downs') or 0} of {votes} rated"),
+            _stat("Fell back", _pct(o.get("fallbacks"), q),
+                  f"{o.get('fallbacks') or 0} used the ReAct loop"),
+            _stat("Empty answers", _pct(o.get("empties"), q),
+                  f"{o.get('empties') or 0} matched nothing"),
+            _stat("Slowest 5%", _ms(o.get("p95_ms")), f"median {_ms(o.get('p50_ms'))}"),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Questions per day", className="adm-sec-h"),
+            dcc.Graph(figure=vfig, config={"displayModeBar": False})
+            if vfig else html.Div("No questions in this window.", className="adm-empty"),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("How they were answered", className="adm-sec-h"),
+            dcc.Graph(figure=rfig, config={"displayModeBar": False})
+            if rfig else html.Div("Nothing to show.", className="adm-empty"),
+            html.P("query_spec is the deterministic path. react is the fallback tool "
+                   "loop — a high share there means questions the QuerySpec engine "
+                   "could not plan.", className="adm-hint"),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Most asked", className="adm-sec-h"),
+            _adm_table(analytics_top_questions(days, 15),
+                       [("question", "Question"), ("asked", "Asked"),
+                        ("users", "People"), ("last_asked", "Last asked")],
+                       "top_questions", "Nothing asked more than once yet.", fetched=15),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Who is using it", className="adm-sec-h"),
+            _adm_table(analytics_top_users(days, 15),
+                       [("email", "Person"), ("questions", "Questions"),
+                        ("p50_ms", "Median"), ("last_seen", "Last seen")],
+                       "top_users", "No activity in this window.", fetched=15),
+        ]),
+    ]
+
+
+def _admin_painpoints_tab(days: Optional[int]) -> List[Any]:
+    """The five things worth acting on, worst-signal first: someone said it was
+    wrong, the agent improvised, the answer was empty, it was slow, a tool
+    failed."""
+    return [
+        html.Div(className="adm-sec", children=[
+            html.Div("Downvoted answers", className="adm-sec-h"),
+            html.P("The strongest signal here — someone read the answer and said it was "
+                   "wrong. The comment is optional, so blanks are normal.",
+                   className="adm-hint"),
+            _adm_table(painpoint_downvotes(days, 60),
+                       [("asked_at", "When"), ("session_key", "Person"),
+                        ("question", "Question"), ("feedback_text", "What they said")],
+                       "downvotes", "No downvotes in this window.", fetched=60),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Fell back to the tool loop", className="adm-sec-h"),
+            html.P("The QuerySpec engine could not plan these, so the agent improvised. "
+                   "Best candidates for a new query shape.", className="adm-hint"),
+            _adm_table(painpoint_fallbacks(days, 60),
+                       [("asked_at", "When"), ("session_key", "Person"),
+                        ("question", "Question"), ("latency_ms", "Took")],
+                       "fallbacks", "Nothing fell back in this window.", fetched=60),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Empty or incomplete", className="adm-sec-h"),
+            html.P("Ran fine and matched nothing, or was missing something the agent "
+                   "needed. Usually a vocabulary gap — which is what the glossary is for.",
+                   className="adm-hint"),
+            _adm_table(painpoint_empty(days, 60),
+                       [("asked_at", "When"), ("session_key", "Person"),
+                        ("question", "Question"), ("notice", "Why")],
+                       "empty", "Nothing empty or incomplete in this window.", fetched=60),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Slowest questions", className="adm-sec-h"),
+            _adm_table(painpoint_slow(days, 25),
+                       [("latency_ms", "Took"), ("asked_at", "When"),
+                        ("session_key", "Person"), ("question", "Question")],
+                       "slow", "No timings in this window.", fetched=25),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Failing MCP tool calls", className="adm-sec-h"),
+            html.P("From the MCP server's own audit, so this is the one panel that sees "
+                   "the gateway. Failures here while the chat looks healthy usually mean "
+                   "Instant Graph, not this code.", className="adm-hint"),
+            _adm_table(painpoint_tool_failures(days, 40),
+                       [("tool_name", "Tool"), ("error_message", "Error"),
+                        ("failures", "Count"), ("last_failed", "Last seen")],
+                       "tool_failures", "No tool failures in this window. ", fetched=40),
+        ]),
+        html.Div(className="adm-sec", children=[
+            html.Div("Errored answers", className="adm-sec-h"),
+            _adm_table(painpoint_errors(days, 40),
+                       [("asked_at", "When"), ("session_key", "Person"),
+                        ("question", "Question"), ("answer", "What it said")],
+                       "errors", "No errors in this window.", fetched=40),
+        ]),
+    ]
+
+
+def admin_panel(state: Optional[Dict[str, Any]] = None) -> Any:
+    """The admin surface: SME approvals, usage analytics and painpoints.
+
+    Reads straight from Postgres and roles.yaml on every render, so it always
+    shows live state — there is no cached copy to go stale while an admin is
+    looking at it."""
+    state = state or {}
+    tab = state.get("tab") or "requests"
+    days = state.get("days", 30) or None
+    notice = state.get("notice")
+
+    if tab == "usage":
+        body = _admin_usage_tab(days)
+    elif tab == "painpoints":
+        body = _admin_painpoints_tab(days)
+    else:
+        body = _admin_requests_tab()
+
+    return html.Div(className="adm-backdrop", children=[
+        html.Div(className="adm-card", children=[
+            html.Div(className="adm-head", children=[
+                html.Div([html.Span("🛡️  ", style={"fontSize": "17px"}), "Admin"],
+                         className="adm-title"),
+                html.Button("Close", id="admin-close-btn", n_clicks=0, className="fbm-btn-ghost"),
+            ]),
+            _admin_tabs(tab),
+            html.Div(notice, className="adm-notice") if notice else None,
+            _admin_range(state.get("days", 30)) if tab in ("usage", "painpoints") else None,
+            html.Div(body),
+        ]),
+    ])
+
+
 # ── Main app layout ──────────────────────────────────────────────────────────
 
 def _fmt_conv_meta(ts: Any) -> str:
@@ -5627,7 +6778,7 @@ def conv_items(convs, active_cid):
     return items
 
 
-def sidebar(convs, active_cid, email: str = ""):
+def sidebar(convs, active_cid, email: str = "", sme_request=None):
     """BUGFIX: the "New conversation" button must stay OUTSIDE the subtree
     that gets re-rendered when the conversation list/highlight changes.
 
@@ -5646,8 +6797,8 @@ def sidebar(convs, active_cid, email: str = ""):
         html.Button("＋  New conversation", id="new-conv", n_clicks=0, className="s-new"),
         html.Div(conv_items(convs, active_cid), id="conv-list-host", className="s-list"),
     ]
-    # Glossary editing is restricted (GLOSSARY_EDITORS), so the button is only
-    # rendered for those users. This is presentation only — open_glossary_modal
+    # Glossary editing is restricted to admins and SMEs (config/roles.yaml),
+    # so the button is only rendered for those users. This is presentation only — open_glossary_modal
     # and submit_glossary_term both re-check server-side, since a hidden button
     # stops nobody from issuing the callback request by hand.
     #
@@ -5658,16 +6809,30 @@ def sidebar(convs, active_cid, email: str = ""):
         children.append(
             html.Button("📖  Add glossary term", id="glossary-add-btn", n_clicks=0,
                         className="s-new"))
+    else:
+        # Everyone else gets the way IN to that button instead of the button.
+        # Disabled while an application is waiting, so the queue does not fill
+        # with the same person clicking again — they can still reapply after a
+        # rejection, which is what latest_sme_request tells us here.
+        pending = (sme_request or {}).get("status") == "pending"
+        children.append(
+            html.Button(
+                ippms_config.content("sme_access", "pending_button" if pending else "apply_button"),
+                id="sme-apply-btn", n_clicks=0, className="s-new", disabled=pending))
+    if is_admin(email):
+        children.append(
+            html.Button("🛡️  Admin", id="admin-open-btn", n_clicks=0, className="s-new"))
     return html.Div(className="sidebar", children=children)
 
 
-def main_page(email: str, convs, active_cid, messages, feedback, pending):
+def main_page(email: str, convs, active_cid, messages, feedback, pending,
+              sme_request=None):
     return html.Div(className="shell", children=[
         html.Div(className="topbar", children=[
             html.Div(className="t-brand", children=[
                 html.Span("◈", className="t-icon", style={"color": "var(--cyan)"}),
-                html.Div([html.Div("Talk to VI-IPPMS", className="t-name"),
-                          html.Div("Instant Graph · conversational analytics", className="t-sub")]),
+                html.Div([html.Div(ippms_config.content("brand", "name"), className="t-name"),
+                          html.Div(ippms_config.content("brand", "tagline"), className="t-sub")]),
             ]),
             html.Div(className="t-right", children=[
                 html.Span([html.Span(className="live-dot"), "  live APIs"]),
@@ -5675,7 +6840,7 @@ def main_page(email: str, convs, active_cid, messages, feedback, pending):
                 html.Button("Sign out", id="logout-btn", n_clicks=0, className="logout"),
             ]),
         ]),
-        sidebar(convs, active_cid, email),
+        sidebar(convs, active_cid, email, sme_request),
         html.Div(className="main", children=[
             html.Div(className="scroll", children=[
                 html.Div(id="stream-host", children=render_stream(messages, feedback, pending))
@@ -5711,6 +6876,9 @@ app.layout = html.Div([
     dcc.Store(id="sfbmodal", storage_type="memory", data=None),   # {"index": <msg index>} or None
     dcc.Store(id="sdelmodal", storage_type="memory", data=None),  # {"cid":..., "title":...} or None
     dcc.Store(id="sglossary", storage_type="memory", data=None),  # True while the form is open
+    # None when closed; the user's latest application row (or {}) when open —
+    # the row is what the form needs to show a previous rejection note.
+    dcc.Store(id="ssme", storage_type="memory", data=None),
     dcc.Download(id="csv-dl"),
     html.Div(id="login-view", children=login_page(), style={"display": "block"}),
     html.Div(id="main-view", children=main_page("", [], None, [], {}, False), style={"display": "none"}),
@@ -5718,6 +6886,12 @@ app.layout = html.Div([
     html.Div(id="del-modal-host"),
     html.Div(id="glossary-modal-host"),
     html.Div(id="glossary-toast"),
+    html.Div(id="sme-modal-host"),
+    html.Div(id="sme-toast"),
+    # None when closed; a dict when open (carrying the last action's notice).
+    dcc.Store(id="sadmin", storage_type="memory", data=None),
+    html.Div(id="admin-modal-host"),
+    dcc.Download(id="admin-csv-dl"),
 ])
 
 
@@ -5755,7 +6929,12 @@ def route_page(auth, feedback):
         msgs = load_conversation_messages(active_cid, sess["email"])
     else:
         active_cid, msgs = None, []
-    main = main_page(sess["email"], convs, active_cid, msgs, feedback or {}, False)
+    # Only looked up for people who cannot already edit the glossary — an
+    # admin or SME never sees the apply button, so the query would be waste.
+    sme_request = (None if can_edit_glossary(sess["email"])
+                   else latest_sme_request(sess["email"]))
+    main = main_page(sess["email"], convs, active_cid, msgs, feedback or {}, False,
+                     sme_request)
     return (no_update, main, {"display": "none"}, {"display": "block"},
             msgs, convs, active_cid)
 
@@ -6230,6 +7409,283 @@ def confirm_delete_conversation(_ok, _cancel, convs, cid, msgs, feedback, auth):
             render_stream(new_msgs, feedback or {}, False), conv_items(convs, new_cid))
 
 
+# ── Admin panel (approvals queue + config reload) ────────────────────────────
+#  Every callback here re-checks is_admin() against the session. The sidebar
+#  only renders the button for admins, but that is presentation: the callbacks
+#  are reachable by hand.
+
+@app.callback(
+    Output("sadmin", "data"),
+    Input("admin-open-btn", "n_clicks"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def open_admin_panel(_n, auth):
+    """Open the panel.
+
+    Open and Close are two callbacks, not one with two Inputs, and that is not
+    a style choice. Dash will not fire a callback whose plain-id Input is
+    absent from the current layout, and admin-close-btn only exists once the
+    panel is rendered — so a combined callback could never fire at all: the
+    panel cannot open because Close does not exist, and Close cannot exist
+    until the panel opens. Splitting them is the fix.
+
+    (The three other multi-Input callbacks in this app are safe because their
+    Inputs appear together — both buttons of one modal, or the login form.)"""
+    # n_clicks == 0 means the sidebar was just rebuilt, not clicked.
+    if not _n:
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        log.warning("[ADMIN] refused panel open by %s", (sess or {}).get("email"))
+        return no_update
+    return {"tab": "requests", "days": 30}
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input("admin-close-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def close_admin_panel(_n):
+    # Fires once at 0 the moment the panel inserts this button; ignore that.
+    return None if _n else no_update
+
+
+@app.callback(
+    Output("admin-modal-host", "children"),
+    Input("sadmin", "data"),
+    State("sauth", "data"),
+)
+def render_admin_panel(data, auth):
+    if data is None:
+        return None
+    # Re-checked on render too: a stale store from a session whose role was
+    # revoked must not paint the panel.
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        return None
+    return admin_panel(data)
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input({"type": "sme-decide", "id": ALL, "action": ALL}, "n_clicks"),
+    State({"type": "sme-note", "id": ALL}, "value"),
+    State({"type": "sme-note", "id": ALL}, "id"),
+    State("sauth", "data"),
+    State("sadmin", "data"),
+    prevent_initial_call=True,
+)
+def decide_sme(n_clicks, note_values, note_ids, auth, state):
+    """Approve / reject / revoke. Re-rendering the panel afterwards is what
+    refreshes the lists, so there is no separate refresh step to forget."""
+    # Every button in the panel fires this at 0 the moment the panel is
+    # inserted — the same insert-fire the rest of the app guards against.
+    if not any(n_clicks or []):
+        return no_update
+    trigger = ctx.triggered_id
+    if not isinstance(trigger, dict):
+        return no_update
+
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        log.warning("[ADMIN] refused SME decision by %s", (sess or {}).get("email"))
+        return no_update
+
+    # Pair each note box with its row so the right note reaches the right
+    # decision — ALL preserves order, but matching on id is what makes that
+    # safe rather than merely true today.
+    notes = {i["id"]: (v or "") for i, v in zip(note_ids or [], note_values or [])}
+    ok, msg = decide_sme_request(trigger["id"], trigger["action"],
+                                 sess["email"], notes.get(trigger["id"], ""))
+    return {**(state or {}), "notice": msg if ok else f"Could not do that — {msg}"}
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input("admin-reload-btn", "n_clicks"),
+    State("sauth", "data"),
+    State("sadmin", "data"),
+    prevent_initial_call=True,
+)
+def admin_reload_config(_n, auth, state):
+    """Re-read config/roles.yaml and config/content.yaml without a restart.
+
+    Reports per file, because they reload independently: a broken content.yaml
+    must not hide the fact that roles.yaml applied cleanly."""
+    if not _n:
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        log.warning("[ADMIN] refused config reload by %s", (sess or {}).get("email"))
+        return no_update
+    report = ippms_config.reload_config()
+    log.info("[ADMIN] config reloaded by %s: %s", sess["email"], report)
+    parts = []
+    for name in ("roles", "content"):
+        r = report.get(name, {})
+        if r.get("ok"):
+            extra = (f" — {r['admins']} admin(s), {r['smes']} seed SME(s)"
+                     if name == "roles" else "")
+            parts.append(f"{name}.yaml reloaded{extra}")
+        else:
+            parts.append(f"{name}.yaml FAILED ({r.get('error')}) — previous version kept")
+    return {**(state or {}), "notice": " · ".join(parts)}
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input({"type": "adm-tab", "tab": ALL}, "n_clicks"),
+    State("sadmin", "data"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def admin_switch_tab(n_clicks, state, auth):
+    # Every tab button fires this at 0 when the panel is inserted.
+    if not any(n_clicks or []):
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        return no_update
+    trigger = ctx.triggered_id
+    if not isinstance(trigger, dict):
+        return no_update
+    # Drop the notice: it described the previous tab's action.
+    keep = {k: v for k, v in (state or {}).items() if k != "notice"}
+    return {**keep, "tab": trigger["tab"]}
+
+
+@app.callback(
+    Output("sadmin", "data", allow_duplicate=True),
+    Input({"type": "adm-days", "days": ALL}, "n_clicks"),
+    State("sadmin", "data"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def admin_switch_range(n_clicks, state, auth):
+    if not any(n_clicks or []):
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        return no_update
+    trigger = ctx.triggered_id
+    if not isinstance(trigger, dict):
+        return no_update
+    keep = {k: v for k, v in (state or {}).items() if k != "notice"}
+    return {**keep, "days": trigger["days"]}
+
+
+# What each CSV button exports. Mapped rather than eval'd so a crafted
+# component id cannot reach an arbitrary function.
+_ADMIN_CSV_SOURCES = {
+    "top_questions":  analytics_top_questions,
+    "top_users":      analytics_top_users,
+    "downvotes":      painpoint_downvotes,
+    "fallbacks":      painpoint_fallbacks,
+    "empty":          painpoint_empty,
+    "slow":           painpoint_slow,
+    "errors":         painpoint_errors,
+    "tool_failures":  painpoint_tool_failures,
+}
+
+
+@app.callback(
+    Output("admin-csv-dl", "data"),
+    Input({"type": "adm-csv", "what": ALL}, "n_clicks"),
+    State("sadmin", "data"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def admin_download_csv(n_clicks, state, auth):
+    """Export the table behind a button. Re-runs the same query rather than
+    exporting what is on screen, so the file matches the current window even if
+    the panel has been open a while — and re-checks admin, because a download
+    of the full question history is exactly what should not be reachable by
+    anyone who can guess a component id."""
+    if not any(n_clicks or []):
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess or not is_admin(sess.get("email")):
+        log.warning("[ADMIN] refused CSV export by %s", (sess or {}).get("email"))
+        return no_update
+    trigger = ctx.triggered_id
+    if not isinstance(trigger, dict):
+        return no_update
+    fn = _ADMIN_CSV_SOURCES.get(trigger.get("what"))
+    if not fn:
+        return no_update
+    days = (state or {}).get("days", 30) or None
+    rows = fn(days, 5000)
+    log.info("[ADMIN] %s exported %s (%d rows)", sess["email"], trigger["what"], len(rows))
+    return _csv_download(rows, list(rows[0].keys()) if rows else [],
+                         "admin", trigger["what"])
+
+
+# ── SME access requests (sidebar 🙋 -> form -> vi_sme_requests) ───────────────
+
+@app.callback(
+    Output("ssme", "data"),
+    Input("sme-apply-btn", "n_clicks"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def open_sme_modal(_n, auth):
+    # n_clicks == 0 means the button was just (re)inserted by a page rebuild,
+    # not pressed — same guard as new_conv/do_logout.
+    if not _n:
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess:
+        return no_update
+    # Someone who can already edit the glossary has nothing to apply for.
+    # Re-checked here rather than trusting the sidebar to have hidden it.
+    if can_edit_glossary(sess.get("email")):
+        return no_update
+    row = latest_sme_request(sess["email"]) or {}
+    # Timestamps are not JSON-serialisable and the form does not use them.
+    return {k: v for k, v in row.items() if k in ("status", "decision_note")}
+
+
+@app.callback(
+    Output("sme-modal-host", "children"),
+    Input("ssme", "data"),
+)
+def render_sme_modal(data):
+    return sme_apply_modal(data) if data is not None else None
+
+
+@app.callback(
+    Output("ssme", "data", allow_duplicate=True),
+    Output("sme-error", "children"),
+    Output("sme-toast", "children"),
+    Input("sme-submit", "n_clicks"),
+    Input("sme-cancel", "n_clicks"),
+    State("sme-justification", "value"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def submit_sme_apply(_submit, _cancel, justification, auth):
+    """Validate, record, and close. Same shape as submit_glossary_term: both
+    buttons exist the moment the modal is inserted, which fires this callback
+    with both at 0."""
+    if not (_submit or _cancel):
+        return no_update, no_update, no_update
+    if ctx.triggered_id == "sme-cancel":
+        return None, no_update, no_update
+
+    sess = session_get((auth or {}).get("token"))
+    if not sess:
+        return None, no_update, no_update
+
+    ok, msg = submit_sme_request(sess["email"], justification)
+    if not ok:
+        return no_update, html.Div(msg, className="fbm-err"), no_update
+    # Closing the modal leaves the sidebar button stale until the next page
+    # render; the toast is what tells them it landed.
+    return None, no_update, html.Div(msg, className="toast")
+
+
 # ── Glossary capture (sidebar 📖 -> form -> upsert) ───────────────────────────
 
 @app.callback(
@@ -6289,7 +7745,7 @@ def submit_glossary_term(_submit, _cancel, term, full_form, definition, aka, aut
     # The real authorization gate for writes. Hiding the sidebar button is
     # presentation only; this is what actually stops a non-editor's write,
     # including one issued by hand or left over from a stale open form after
-    # the GLOSSARY_EDITORS list changed.
+    # roles.yaml changed or an SME grant was revoked.
     if not can_edit_glossary(sess.get("email")):
         log.warning("[GLOSSARY] refused edit by unauthorized user %s", sess.get("email"))
         return no_update, html.Div(
@@ -6326,6 +7782,13 @@ def _warm_tools():
 
 
 def _warm_startup():
+    # First, so a broken roles.yaml is shouted about in the boot log rather
+    # than discovered by the first user who finds their button missing.
+    ippms_config.reload_config()
+    # Runtime SME grants live in Postgres; roles.yaml alone knows nothing about
+    # them until this is wired up. Registered before anything can resolve a
+    # role, so there is no window where an approved SME reads as a normal user.
+    ippms_config.set_sme_grant_provider(approved_sme_emails)
     _warm_tools()
     _load_question_guide()          # build the local RAG index (§4.2D)
     _ensure_logging_tables()        # best-effort create vi_chat_* tables (§3.5)
@@ -6333,6 +7796,7 @@ def _warm_startup():
     _ensure_conversation_tables()   # best-effort create chat history tables, independently
     _ensure_retention_sweeper()     # start the 7-day retention purge thread
     _ensure_glossary_table()        # best-effort create vi_glossary_terms, independently
+    _ensure_sme_tables()            # best-effort create vi_sme_requests, independently
     log.info("[STARTUP] tool KB %s, question guide %d rows, logging %s, "
              "user_feedback %s, chat_history %s, glossary %s.",
              "loaded" if TOOL_KB_TEXT else "MISSING", len(_GUIDE_ROWS),
@@ -6340,6 +7804,10 @@ def _warm_startup():
              "ready" if _user_feedback_ready else "disabled",
              "ready" if _conversation_tables_ready else "disabled",
              "ready" if _glossary_ready else "disabled")
+    log.info("[STARTUP] SME applications %s.", "ready" if _sme_ready else "disabled")
+    log.info("[STARTUP] roles: %d admin(s), %d seed SME(s) from %s",
+             len(ippms_config.admin_emails()), len(ippms_config.seed_sme_emails()),
+             ippms_config.CONFIG_DIR)
 
 
 if __name__ == "__main__":

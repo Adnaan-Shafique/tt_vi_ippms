@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Talk-to-VI-IPPMS — who can do what
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  ►► THIS FILE IS THE TRUST ANCHOR. IT IS NEVER WRITTEN BY THE APPLICATION. ◄◄
+#
+#  Three roles:
+#
+#    admin  — everything an SME can do, PLUS the analytics dashboard and the
+#             power to approve or reject SME applications.
+#    sme    — can add and edit glossary terms.
+#    user   — everyone else. Sees an "Apply for SME access" button instead of
+#             the glossary form. This is the default: a person does not need
+#             to appear in this file to use the assistant.
+#
+#  Admins are listed ONLY here, on purpose. If the admin list were editable
+#  through the web UI, anyone who compromised one admin account could promote
+#  themselves permanently. Granting admin requires shell access to this host
+#  and a commit — that is the point, not an oversight.
+#
+#  SMEs can come from two places: seeded here (below), or approved at runtime
+#  by an admin, which is recorded in the vi_sme_requests table rather than in
+#  this file. Runtime grants are state and belong in Postgres, where they get
+#  a timestamp, an approver and an audit trail; a config file would lose all
+#  three and be reverted by the next deploy.
+#
+#  Emails are matched case-insensitively, so the casing here does not matter.
+#
+#  After editing: restart the service, or use "Reload config" on the admin
+#  dashboard. Nothing picks this up mid-request on its own.
+
+version: 1
+
+admins:
+  - mohammed.shafique@vodafoneidea.com
+  - devang.sheth@vodafoneidea.com
+  - vimal.atolia@vodafoneidea.com
+  - vaibhav.patil@vodafoneidea.com
+  - rahul.kulthe@vodafoneidea.com
+  - harish.saragadam@vodafoneidea.com
+
+# Seed SMEs. These are the members of the previous hardcoded GLOSSARY_EDITORS
+# set who are not admins — listing them here preserves the glossary access they
+# already had. Everyone granted SME from here on goes through the approval
+# workflow instead, so this list should stay short and stop growing.
+smes:
+  - amol.libe2@vodafoneidea.com
+  - bhaskar.roy@vodafoneidea.com
+  - apurva.singh2@vodafoneidea.com

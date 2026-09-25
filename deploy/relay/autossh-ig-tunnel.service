@@ -1,0 +1,37 @@
+# /etc/systemd/system/autossh-ig-tunnel.service   — on 10.19.75.115
+#
+#  FALLBACK to the squid relay (deploy/relay/squid-ig-relay.conf), for when
+#  you cannot install a proxy on FALCONPRD. Forwards 127.0.0.1:5001 on this
+#  host through .246 to the Instant Graph gateway.
+#
+#  Then set, in the MCP server's .env:
+#      INSTANT_GRAPH_BASE_URL=https://127.0.0.1:5001/api/api
+#      IG_CERT_HOSTNAME=ippms.vodafoneidea.com    # still required, still works
+#  and leave HTTPS_PROXY UNSET.
+#
+#  TLS still terminates at the real gateway, so cert pinning is unaffected by
+#  the address change — assert_hostname checks the SAN, not the IP dialled.
+#
+#  Requires: autossh, plus a key for ippms@10.19.75.115 -> 10.19.71.246.
+#  Prefer the squid relay: one less daemon, one less keypair to rotate.
+
+[Unit]
+Description=autossh tunnel to Instant Graph gateway via FALCONPRD
+After=network-online.target
+Wants=network-online.target
+Before=ippms-mcp@prod.service ippms-mcp@test.service
+
+[Service]
+Type=simple
+User=ippms
+Environment=AUTOSSH_GATETIME=0
+Environment=AUTOSSH_POLL=30
+ExecStart=/usr/bin/autossh -M 0 -N \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
+  -L 127.0.0.1:5001:10.34.64.74:5001 ippms@10.19.71.246
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

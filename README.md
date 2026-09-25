@@ -1,5 +1,7 @@
 # Talk-to-VI-IPPMS
 
+[![version](https://img.shields.io/badge/version-1.0.0-blue)](CHANGELOG.md)
+
 Conversational analytics over the **Instant Graph** network-monitoring APIs.
 
 Ask, in plain English, questions about VI-IPPMS metadata and KPIs:
@@ -37,9 +39,25 @@ APIs, reached as MCP tools. All reasoning runs on a **local, airgapped** model
                                          ▼
                             Instant Graph REST  https://10.34.64.74:5001
                                          
-                 both processes ──► Postgres 10.19.75.115 : conv_ai_db
+                 both processes ──► Postgres (local) : conv_ai_db
                                     schema tt_vi_ippms_schema
 ```
+
+### Deployment topology
+
+The app runs on **`10.19.75.115`**, which is also the Postgres host — so the
+database connection is loopback. That host has **no GPU and no route to the
+Instant Graph gateway**, so both of those are reached through **FALCONPRD
+(`10.19.71.246`)**:
+
+- **Gateway** — via a squid **CONNECT** relay on `.246:3128`. Squid never
+  decrypts, so TLS stays end-to-end and the gateway's self-signed cert and SAN
+  pinning keep working unchanged.
+- **GPU inference** — direct HTTP to `.246:8071` (excluded from the relay via
+  `NO_PROXY`).
+
+FALCONPRD is therefore a **permanent production dependency**, not a legacy
+host. See `docs/MIGRATION_10.19.75.115.md`.
 
 ### The two processes
 
@@ -168,23 +186,50 @@ removed from source — see CHANGELOG 6.7.2-r1):
 
 ## Running it
 
-Order matters.
+Production runs under **systemd**, as two independent environments:
+
+| | prod | test |
+|---|---|---|
+| Chat UI | `:8079` | `:8179` |
+| Ops console | `:8060` | `:8160` |
+| MCP (loopback only) | `:8056` | `:8156` |
+| DB schema | `tt_vi_ippms_schema` | `tt_vi_ippms_schema_test` |
 
 ```bash
-# 1 — MCP server (must be up first)
-set -a; . ./.env; set +a
-python3 src/instant_graph_mcp_server_v2_5.py
-
-# 2 — chat app
-set -a; . ./.env; set +a
-python3 src/talk_to_vi_ippms_updated_6_7_2.py
+sudo systemctl status 'ippms-mcp@*' 'ippms-app@*'
+journalctl -u ippms-app@test -f
 ```
 
-Then browse to `http://<host>:8079/` (chat) or `http://<host>:8060/` (ops
-console — the fastest way to sanity-check the API wiring end to end).
+Release cycle: merge to `main` → deploy to **test** → tag → promote.
 
-For production use the systemd units in `deploy/` instead — they handle
-ordering, restart, and `EnvironmentFile` loading.
+```bash
+deploy/promote.sh v1.1.0        # deploys a tested tag to prod, auto-rollback
+deploy/preflight.sh /etc/ippms-assistant/ippms-prod.env
+```
+
+Running it beside an existing deployment on FALCONPRD:
+**`docs/STAGING_ON_FALCONPRD.md`**.
+Setting this up on a new host from a zip: **`docs/DEPLOY_FROM_ZIP.md`**.
+Day-to-day environment layout and the acceptance checklist:
+**`docs/ENVIRONMENTS.md`**. Why it is shaped this way:
+**`docs/MIGRATION_10.19.75.115.md`**.
+
+> The zip does **not** contain `assets/`, `ig_selfsigned.pem` or `.env` —
+> all three are gitignored. They must be copied across separately, or
+> nothing starts. See `docs/DEPLOY_FROM_ZIP.md` §1.2.
+
+### Running by hand (debugging)
+
+Order matters — the chat app is a client of the MCP server:
+
+```bash
+set -a; . ./.env; set +a
+python3 src/instant_graph_mcp_server_v2_5.py     # first
+python3 src/talk_to_vi_ippms_updated_6_7_2.py    # then
+```
+
+The ops console (`:8060`) is the fastest way to sanity-check the API wiring
+end to end: host → component → interface → KPI → historical data.
 
 ### Dependencies
 
@@ -194,12 +239,53 @@ pip install -r requirements.txt
 
 ---
 
-## Glossary editors
+## Roles
 
-Only the emails in `GLOSSARY_EDITORS` (near the top of the chat app) may add or
-edit glossary terms. This is enforced **server-side on both the open and the
-submit path** — a hidden button is not access control. To grant or revoke
-access, edit that set and restart.
+Three roles, resolved in `src/ippms_config.py`:
+
+| Role | Can do | Comes from |
+|---|---|---|
+| `admin` | everything an SME can, plus the analytics dashboard and approving SME applications | `config/roles.yaml` **only** |
+| `sme` | add and edit glossary terms | `config/roles.yaml`, or an admin's approval recorded in `vi_sme_requests` |
+| `user` | ask questions; can apply for SME access | the default — nobody needs listing to use the assistant |
+
+Admins are listed only in the YAML file and are deliberately **not** grantable
+through the web UI: if they were, compromising one admin account would be
+enough to make the compromise permanent. Runtime SME grants live in Postgres
+instead, because a grant is state — it has an approver and a timestamp, and it
+has to survive a deploy.
+
+Every check is enforced **server-side on both the open and the submit path** —
+a hidden button is not access control.
+
+To change the roster: edit `config/roles.yaml`, then either restart or press
+**Reload config** on the admin panel. A malformed file keeps the previous roles
+in force and logs the reason rather than revoking everyone's access.
+
+## Glossary
+
+SMEs record terms, abbreviations and business rules through the chat UI; those
+definitions are then injected into the router and synthesis prompts for any
+question that mentions them.
+
+**The question text is never rewritten.** Substituting `GJW` with
+`Gujarat West` before parsing would corrupt the identifiers the executor
+matches on — `APVSPGJWPAR01HNE40` contains `GJW`. Definitions travel
+*alongside* the original question, and matching is word-boundary anchored so a
+term cannot fire on a substring of a hostname.
+
+This does mean identical questions can legitimately differ over time as the
+glossary changes. Each interaction therefore records the `glossary_version` it
+was answered under and the `glossary_terms` that were injected, so:
+
+```sql
+SELECT id, asked_at, glossary_version, glossary_terms, answer
+  FROM tt_vi_ippms_schema.vi_chat_interactions
+ WHERE lower(btrim(question)) = lower('what is the MTTR for GJW')
+ ORDER BY asked_at;
+```
+
+answers "why did this change?" directly.
 
 ---
 
@@ -214,14 +300,51 @@ access, edit that set and restart.
 ├── src/
 │   ├── talk_to_vi_ippms_updated_6_7_2.py
 │   └── instant_graph_mcp_server_v2_5.py
+├── sql/
+│   └── setup_ig_auth_tables.sql       ← the 2 tables that do NOT auto-create
 ├── assets/                            ← tool KB + question guide (gitignored)
 ├── deploy/
-│   ├── instant-graph-mcp.service
-│   └── talk-to-vi-ippms.service
+│   ├── ippms-mcp@.service     ← templated: @prod / @test
+│   ├── ippms-app@.service
+│   ├── promote.sh                     ← tested tag → prod, with rollback
+│   ├── preflight.sh                   ← verify every external dependency
+│   └── relay/
+│       ├── squid-ig-relay.conf        ← CONNECT relay, runs on FALCONPRD
+│       └── autossh-ig-tunnel.service  ← fallback
 └── docs/
+    ├── STAGING_ON_FALCONPRD.md        ← run beside the live app on .246
+    ├── DEPLOY_FROM_ZIP.md             ← START HERE on a new host
+    ├── ENVIRONMENTS.md                ← prod/test layout + release cycle
     └── MIGRATION_10.19.75.115.md      ← FALCONPRD → 10.19.75.115 runbook
 ```
 
-Filenames keep their version suffixes so existing run commands and muscle
-memory still work. From here on, **git tags are the source of truth for
-versions** — see `CHANGELOG.md`.
+Filenames keep their version suffixes so existing run commands still work.
+**Git tags are the source of truth for versions** — one version for the whole
+repo, starting at `v1.0.0`. See `CHANGELOG.md`.
+
+---
+
+## Things that fail silently
+
+Three dependencies degrade the assistant without raising an error. When
+answers look wrong but nothing is in the logs, check these first — and this is
+why `deploy/preflight.sh` exists:
+
+| Dependency | Failure mode |
+|---|---|
+| **GPU proxy** | `GPULLMClient.infer()` never raises — it returns `""`. A dead proxy produces bad routing and empty answers, not a crash. |
+| **Question guide** | Missing → app starts normally, RAG retrieval disabled, answer quality quietly drops. |
+| **Postgres** | All logging is best-effort by design; an outage loses history and audit rows without failing a chat turn. |
+
+**Do not run the chat app under gunicorn or another WSGI server.**
+`_warm_startup()` runs only under `if __name__ == "__main__"`
+(`src/talk_to_vi_ippms_updated_6_7_2.py:6343`), so under WSGI the tool KB, the
+RAG index, the table creation and the 7-day chat-history retention sweeper
+never start — conversations then accumulate forever with no error anywhere.
+
+The startup line reports all of them — read it after every deploy:
+
+```
+[STARTUP] tool KB loaded, question guide 142 rows, logging ready,
+          user_feedback ready, chat_history ready, glossary ready.
+```

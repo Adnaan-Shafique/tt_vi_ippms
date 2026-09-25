@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Talk-to-VI-IPPMS — editable user-facing text
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Copy that changes for wording reasons rather than code reasons. Edit freely;
+#  every key is optional and falls back to the built-in default if you remove
+#  it or mistype it.
+#
+#  What is deliberately NOT here: CIRCLE_TOKENS and KPI_SYNONYMS. Those look
+#  like config but are matching logic the executor runs against — changing them
+#  changes which devices an answer covers, so they stay in code where they are
+#  reviewed as code.
+#
+#  After editing: restart the service, or use "Reload config" on the admin
+#  dashboard.
+
+version: 1
+
+brand:
+  name: Talk to VI-IPPMS
+  tagline: Instant Graph · conversational analytics
+
+welcome:
+  eyebrow: TALK TO VI-IPPMS
+  heading: What would you like to know?
+  intro: >-
+    Ask in plain English. The agent routes through Router → Resolve →
+    QuerySpec → deterministic executor → Synthesize (falling back to a
+    ReAct tool loop only for unusual shapes), using live Instant Graph APIs.
+
+# The four capability cards on the welcome screen. Clicking one asks its
+# question, so `question` must be something the assistant can actually answer.
+capabilities:
+  - icon: "🗂️"
+    title: Device metadata
+    description: Counts & listings of devices by circle or name pattern
+    question: How many devices are in the GUJ circle?
+  - icon: "🔌"
+    title: Interfaces & components
+    description: Interfaces / components / KPIs per device
+    question: How many interfaces on APVSPGJWPAR01HNE40?
+  - icon: "📈"
+    title: KPI retrieval
+    description: Values & statistics over a time window
+    question: min/max/avg HC In Octets on Interface 100GE0/3/2 in the last 6 hours
+  - icon: "🧭"
+    title: Filter & slice
+    description: Slice devices/KPIs by circle, component, threshold
+    question: List devices matching PAR01
+
+# Starter chips under the capability cards.
+quick_questions:
+  - How many devices are in the GUJ circle?
+  - List devices matching PAR01
+  - How many components on APVSPGJWPAR01HNE40?
+  - How many KPIs are tracked on APVSPGJWPAR01HNE40?
+
+# Shown when the agent decides the user is asking what it can do. Plain text,
+# not Markdown — newlines and bullets are rendered as written.
+help_text: |-
+  I'm the Talk-to-VI-IPPMS assistant. I answer questions about your network monitoring data using live APIs — no SQL. Try:
+  • Metadata: “How many devices are in the GUJ circle?”, “How many interfaces on APVSPGJWPAR01HNE40?”, “List devices matching PAR01”, “How many KPIs are tracked on that device?”
+  • KPI data: “On <device>, interface 100GE0/3/2, what was HC In Octets in the last 6 hours?”, “min/max/avg traffic on Eth-Trunk1 yesterday”.
+
+# Copy for the SME application flow (roles.yaml explains the roles themselves).
+sme_access:
+  apply_button: 🙋  Apply for SME access
+  pending_button: ⏳  SME request pending
+  modal_title: Apply for SME access
+  modal_blurb: >-
+    SMEs can add glossary terms — the abbreviations, full forms and business
+    rules the assistant uses to understand your questions. Tell the admins why
+    you should have that access and they'll review it.
+  justification_label: Why do you need SME access?
+  justification_placeholder: e.g. I own the Gujarat transport KPI definitions and maintain the naming standards.
+  submitted_toast: Request sent. An admin will review it.
+  approved_toast: Your SME access has been approved — the glossary form is now available.
